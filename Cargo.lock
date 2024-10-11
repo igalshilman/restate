@@ -6248,6 +6248,7 @@ name = "restate-storage-query-datafusion"
 version = "1.1.3"
 dependencies = [
  "ahash",
+ "anyhow",
  "async-trait",
  "bytes",
  "bytestring",
@@ -6269,8 +6270,10 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "strum 0.26.2",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
