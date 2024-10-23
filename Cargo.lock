@@ -5633,6 +5633,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "xxhash-rust",
 ]
 
 [[package]]
