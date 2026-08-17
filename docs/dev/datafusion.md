@@ -24,7 +24,7 @@ The query engine uses a two-tier architecture:
 │  │                    QueryContext                           │  │
 │  │  - DataFusion SessionContext                              │  │
 │  │  - SQL parsing, planning, optimization                    │  │
-│  │  - Accumulations, joins, aggregations                     │  │
+│  │  - Final accumulations, joins, and other operators        │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                              │                                  │
 │                    ┌─────────┴─────────┐                        │
@@ -39,12 +39,18 @@ The query engine uses a two-tier architecture:
           │  (Partition 1)   │   │  (Partition 2)   │
           │                  │   │                  │
           │  RocksDB scan    │   │  RocksDB scan    │
-          │  + deserialize   │   │  + deserialize   │
-          │  on IO threads   │   │  on IO threads   │
+          │  + filter        │   │  + filter        │
+          │  + eligible      │   │  + eligible      │
+          │    partial agg   │   │    partial agg   │
           └──────────────────┘   └──────────────────┘
 ```
 
-**Key principle**: The query engine (accumulations, joins, operators) always runs on the admin node. Workers are "dumb" - they only scan data from RocksDB and apply post-scan filters.
+**Key principle**: The admin node plans the complete query and retains final
+aggregation, joins, and all operators outside the remote execution allowlist. A worker
+can scan, apply the pushed predicate, and execute an explicitly encoded eligible partial
+aggregate before returning accumulator state. See
+[Partial Aggregation Pushdown](partial-aggregation-pushdown.md) for the placement model,
+eligibility rules, compatibility behavior, and cancellation semantics.
 
 ### Key Components
 
@@ -52,8 +58,11 @@ The query engine uses a two-tier architecture:
 |-----------|----------|-------------|
 | `QueryContext` | `storage-query-datafusion/src/context.rs` | Central orchestrator wrapping DataFusion's `SessionContext` |
 | `PartitionedTableProvider` | `storage-query-datafusion/src/table_providers.rs` | DataFusion `TableProvider` for partitioned tables |
+| `LocationAwareScanExec` | `storage-query-datafusion/src/table_providers.rs` | Joins the local and per-owner remote branches of one table scan |
+| `PartitionScanExec` | `storage-query-datafusion/src/table_providers.rs` | Executes the local partitions assigned during planning |
+| `RemoteNodeExec` | `storage-query-datafusion/src/table_providers.rs` | Pulls one node's planned remote scan, optionally with a partial aggregate fragment |
 | `RemoteScannerManager` | `storage-query-datafusion/src/remote_query_scanner_manager.rs` | Routes scans to local or remote partitions |
-| `RemotePartitionsScanner` | `storage-query-datafusion/src/remote_query_scanner_manager.rs` | Decides local vs remote execution per partition |
+| `RemotePartitionsScanner` | `storage-query-datafusion/src/remote_query_scanner_manager.rs` | Resolves local or remote partition placement while the physical plan is built |
 | `LocalPartitionsScanner` | `storage-query-datafusion/src/partition_store_scanner.rs` | Scans local RocksDB partitions |
 | `ScanLocalPartition` | `storage-query-datafusion/src/partition_store_scanner.rs` | Trait defining how each table scans its data |
 | `ScannerTask` | `storage-query-datafusion/src/scanner_task.rs` | Server-side task handling remote scan requests |
@@ -120,10 +129,13 @@ If multiple ids are provided via `IN` lists, each partition key becomes its own 
 
 ### 4. Partition Location Decision
 
-For each partition, `RemotePartitionsScanner::scan_partition` decides whether to scan locally or remotely:
+While building the physical plan, the table provider asks
+`RemotePartitionsScanner::partition_location` for every partition. It groups partitions
+by location and emits a local `PartitionScanExec` plus one opaque `RemoteNodeExec` per
+remote owner. Execution then calls `scan_partition_at` with that fixed placement:
 
 ```rust
-match self.manager.get_partition_target_node(partition_id)? {
+match location {
     PartitionLocation::Local => {
         // Use LocalPartitionsScanner directly
         scanner.scan_partition(...)
@@ -134,6 +146,9 @@ match self.manager.get_partition_target_node(partition_id)? {
     }
 }
 ```
+
+The serving node validates that it still owns the partition. An ownership mismatch
+fails the whole query; execution does not reroute an already planned branch.
 
 ### 5a. Local Scan Path
 
@@ -152,7 +167,7 @@ When the partition is remote, `remote_scan_as_datafusion_stream` manages the RPC
 
 1. **Open scanner**:
    - Establish connection to target node
-   - Send `RemoteQueryScannerOpen` RPC with table name, schema, range, predicate, batch size
+   - Send `RemoteQueryScannerOpen` RPC with table name, schema, range, predicate, batch size, and an optional partial-aggregate fragment
    - Receive `ScannerId` back
 
 2. **Stream batches**:
@@ -160,6 +175,7 @@ When the partition is remote, `remote_scan_as_datafusion_stream` manages the RPC
    - Server's `ScannerTask`:
      - Pulls batch from local scanner stream
      - Applies post-scan filter (predicate evaluation)
+     - For an accepted fragment, consumes the filtered stream into partial accumulator state
      - Encodes batch to Arrow IPC format
      - Sends back via RPC
    - Client decodes batch and yields to DataFusion
@@ -280,22 +296,23 @@ The partition stores have no secondary indices or pre-computed aggregates. Many 
 - **Total state size**: Calculating total state bytes requires scanning all state entries
 - **Non-completed invocations**: Listing or counting active invocations requires scanning all invocations. If the RocksDB key space separated invocations by status, we could efficiently scan only non-completed ones
 
-### Aggregation Optimization
+### Partial Aggregation Pushdown
 
-Currently, aggregations like:
+Eligible aggregations like:
 ```sql
 SELECT status, COUNT(*) FROM sys_invocation_status GROUP BY status
 ```
 
-Send all matching rows back to the admin node, even though counting could happen per-partition.
+execute a partial aggregate on every local and remote placement branch. Remote workers
+return accumulator-state rows instead of all matching input rows, and the coordinator
+reduces those states before DataFusion's existing repartition and final aggregate.
 
-**Future optimization**: Partition the execution plan by node, send partial plans to workers, aggregate locally, then combine results. This would require:
-- Encoding per-node execution plans to protobuf
-- Distributing plans over the network
-- Executing locally and returning partial results
-- Cross-partition accumulation on the coordinator
-
-This is significantly more complex than the current architecture (which only pushes filters, not operators).
+The first version supports grouped and global `count`, `sum`, `min`, `max`, and `avg`
+without aggregate filters, ordering, `DISTINCT`, grouping sets, or aggregate TopK. Other
+shapes retain the coordinator-only plan. The wire field is optional; when an older worker
+does not accept the fragment, the client applies the same partial aggregate to its raw
+stream before exposing it upstream. The full contract is documented in
+[Partial Aggregation Pushdown](partial-aggregation-pushdown.md).
 
 ### Remote Scanner Bottleneck
 
