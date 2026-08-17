@@ -29,12 +29,13 @@ use restate_core::{TaskCenter, TaskCenterFutureExt, TaskKind, task_center};
 use restate_types::identifiers::PartitionId;
 use restate_types::net::remote_query_scanner::{
     RemoteQueryScannerClose, RemoteQueryScannerNext, RemoteQueryScannerNextResult,
-    RemoteQueryScannerOpen, RemoteQueryScannerOpened, RemoteQueryScannerPredicate, ScannerBatch,
-    ScannerFailure, ScannerId,
+    RemoteQueryScannerOpen, RemoteQueryScannerOpened, RemoteQueryScannerPartialAggregate,
+    RemoteQueryScannerPredicate, ScannerBatch, ScannerFailure, ScannerId,
 };
 use restate_types::sharding::KeyRange;
 use restate_types::{GenerationalNodeId, NodeId};
 
+use crate::partial_aggregation::PartialAggregateFragment;
 use crate::{decode_record_batch, encode_expr, encode_schema};
 
 #[derive(derive_more::Debug)]
@@ -129,7 +130,21 @@ pub trait RemoteScannerService: Send + Sync + Debug + 'static {
         &self,
         peer: NodeId,
         req: RemoteQueryScannerOpen,
-    ) -> Result<RemoteScanner, DataFusionError>;
+    ) -> Result<OpenedRemoteScanner, DataFusionError>;
+}
+
+pub struct OpenedRemoteScanner {
+    scanner: RemoteScanner,
+    partial_aggregate_applied: bool,
+}
+
+impl OpenedRemoteScanner {
+    pub fn new(scanner: RemoteScanner, partial_aggregate_applied: bool) -> Self {
+        Self {
+            scanner,
+            partial_aggregate_applied,
+        }
+    }
 }
 
 // ----- service proxy -----
@@ -165,6 +180,72 @@ pub fn remote_scan_as_datafusion_stream(
     limit: Option<usize>,
     expected_partition_owner: Option<GenerationalNodeId>,
 ) -> SendableRecordBatchStream {
+    remote_scan_as_datafusion_stream_inner(
+        service,
+        target_node_id,
+        scanner_id,
+        partition_id,
+        range,
+        table_name,
+        projection_schema,
+        predicate,
+        batch_size,
+        limit,
+        expected_partition_owner,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remote_scan_with_partial_aggregate(
+    service: Arc<dyn RemoteScannerService>,
+    target_node_id: NodeId,
+    scanner_id: ScannerId,
+    partition_id: PartitionId,
+    range: KeyRange,
+    table_name: String,
+    projection_schema: SchemaRef,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+    batch_size: usize,
+    limit: Option<usize>,
+    expected_partition_owner: Option<GenerationalNodeId>,
+    fragment: Arc<PartialAggregateFragment>,
+    context: Arc<datafusion::execution::TaskContext>,
+) -> SendableRecordBatchStream {
+    remote_scan_as_datafusion_stream_inner(
+        service,
+        target_node_id,
+        scanner_id,
+        partition_id,
+        range,
+        table_name,
+        projection_schema,
+        predicate,
+        batch_size,
+        limit,
+        expected_partition_owner,
+        Some((fragment, context)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_scan_as_datafusion_stream_inner(
+    service: Arc<dyn RemoteScannerService>,
+    target_node_id: NodeId,
+    scanner_id: ScannerId,
+    partition_id: PartitionId,
+    range: KeyRange,
+    table_name: String,
+    projection_schema: SchemaRef,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+    batch_size: usize,
+    limit: Option<usize>,
+    expected_partition_owner: Option<GenerationalNodeId>,
+    partial_aggregate: Option<(
+        Arc<PartialAggregateFragment>,
+        Arc<datafusion::execution::TaskContext>,
+    )>,
+) -> SendableRecordBatchStream {
     let predicate_generation = predicate.as_ref().map(snapshot_generation).unwrap_or(0);
     let initial_predicate = predicate
         .as_ref()
@@ -177,8 +258,18 @@ pub fn remote_scan_as_datafusion_stream(
         })
         .transpose();
 
-    let state = match initial_predicate {
-        Ok(initial_predicate) => {
+    let wire_partial_aggregate: Result<Option<RemoteQueryScannerPartialAggregate>, _> =
+        partial_aggregate
+            .as_ref()
+            .map(|(fragment, _)| fragment.to_wire())
+            .transpose();
+    let output_schema = partial_aggregate
+        .as_ref()
+        .map(|(fragment, _)| fragment.output_schema())
+        .unwrap_or_else(|| Arc::clone(&projection_schema));
+
+    let state = match (initial_predicate, wire_partial_aggregate) {
+        (Ok(initial_predicate), Ok(partial_aggregate_request)) => {
             let open_request = RemoteQueryScannerOpen {
                 scanner_id: Some(scanner_id),
                 partition_id,
@@ -189,24 +280,27 @@ pub fn remote_scan_as_datafusion_stream(
                 predicate: initial_predicate,
                 batch_size: u64::try_from(batch_size).expect("batch_size to fit in a u64"),
                 expected_partition_owner,
+                partial_aggregate: partial_aggregate_request,
             };
             RemoteCursorState::Opening(Box::pin(async move {
                 service.open(target_node_id, open_request).await
             }))
         }
-        Err(error) => RemoteCursorState::Failed(Some(error)),
+        (Err(error), _) | (_, Err(error)) => RemoteCursorState::Failed(Some(error)),
     };
 
     Box::pin(RemoteCursorStream {
-        schema: projection_schema,
+        schema: output_schema,
+        raw_schema: projection_schema,
         predicate,
         predicate_generation,
+        partial_aggregate,
         state,
     })
 }
 
 enum RemoteCursorState {
-    Opening(BoxFuture<'static, Result<RemoteScanner, DataFusionError>>),
+    Opening(BoxFuture<'static, Result<OpenedRemoteScanner, DataFusionError>>),
     Ready(RemoteScanner),
     Pulling(
         BoxFuture<
@@ -217,14 +311,20 @@ enum RemoteCursorState {
             ),
         >,
     ),
+    Fallback(SendableRecordBatchStream),
     Failed(Option<DataFusionError>),
     Done,
 }
 
 struct RemoteCursorStream {
     schema: SchemaRef,
+    raw_schema: SchemaRef,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     predicate_generation: u64,
+    partial_aggregate: Option<(
+        Arc<PartialAggregateFragment>,
+        Arc<datafusion::execution::TaskContext>,
+    )>,
     state: RemoteCursorState,
 }
 
@@ -238,8 +338,34 @@ impl Stream for RemoteCursorStream {
             match &mut this.state {
                 RemoteCursorState::Opening(open) => match open.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(scanner)) => {
-                        this.state = RemoteCursorState::Ready(scanner);
+                    Poll::Ready(Ok(opened)) => {
+                        let OpenedRemoteScanner {
+                            scanner,
+                            partial_aggregate_applied,
+                        } = opened;
+                        if let Some((fragment, context)) = this.partial_aggregate.take()
+                            && !partial_aggregate_applied
+                        {
+                            let raw_cursor = Self {
+                                schema: Arc::clone(&this.raw_schema),
+                                raw_schema: Arc::clone(&this.raw_schema),
+                                predicate: this.predicate.clone(),
+                                predicate_generation: this.predicate_generation,
+                                partial_aggregate: None,
+                                state: RemoteCursorState::Ready(scanner),
+                            };
+                            match fragment.execute_stream(Box::pin(raw_cursor), context) {
+                                Ok(stream) => {
+                                    this.state = RemoteCursorState::Fallback(stream);
+                                }
+                                Err(error) => {
+                                    this.state = RemoteCursorState::Done;
+                                    return Poll::Ready(Some(Err(error)));
+                                }
+                            }
+                        } else {
+                            this.state = RemoteCursorState::Ready(scanner);
+                        }
                     }
                     Poll::Ready(Err(error)) => {
                         this.state = RemoteCursorState::Done;
@@ -320,6 +446,7 @@ impl Stream for RemoteCursorStream {
                         }
                     }
                 }
+                RemoteCursorState::Fallback(stream) => return stream.as_mut().poll_next(cx),
                 RemoteCursorState::Failed(error) => {
                     return Poll::Ready(error.take().map(Err));
                 }
@@ -388,7 +515,7 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
         &self,
         peer: NodeId,
         req: RemoteQueryScannerOpen,
-    ) -> Result<RemoteScanner, DataFusionError> {
+    ) -> Result<OpenedRemoteScanner, DataFusionError> {
         let connection = self
             .networking
             .get_connection(peer, Swimlane::Datafusion)
@@ -432,7 +559,14 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
                     remote_scanner.forget();
                     remote_scanner = RemoteScanner::new(scanner_id, connection.clone())
                 }
-                Ok(remote_scanner)
+                Ok(OpenedRemoteScanner::new(remote_scanner, false))
+            }
+            Ok(RemoteQueryScannerOpened::SuccessWithPartialAggregate { scanner_id }) => {
+                if remote_scanner.scanner_id != scanner_id {
+                    remote_scanner.forget();
+                    remote_scanner = RemoteScanner::new(scanner_id, connection.clone())
+                }
+                Ok(OpenedRemoteScanner::new(remote_scanner, true))
             }
             Ok(RemoteQueryScannerOpened::Failure) => {
                 remote_scanner.forget();

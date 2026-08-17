@@ -41,6 +41,7 @@ use restate_types::sharding::KeyRange;
 
 use crate::context::SelectPartitions;
 use crate::filter::{FirstMatchingPartitionKeyExtractor, PointReadFanout};
+use crate::partial_aggregation::PartialAggregateFragment;
 use crate::table_util::{find_sort_columns, make_ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,38 @@ pub trait ScanPartition: Send + Sync + Debug + 'static {
             limit,
             elapsed_compute,
         )
+    }
+
+    /// Scans a partition and produces partial aggregate state. Distributed
+    /// scanners override this to negotiate execution on the selected node. The
+    /// default executes the same fragment locally over the raw scan stream.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_partition_at_with_partial_aggregate(
+        &self,
+        location: PartitionLocation,
+        partition_id: PartitionId,
+        range: KeyRange,
+        projection: SchemaRef,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
+        batch_size: usize,
+        limit: Option<usize>,
+        elapsed_compute: Time,
+        fragment: Arc<PartialAggregateFragment>,
+        context: Arc<TaskContext>,
+    ) -> anyhow::Result<SendableRecordBatchStream> {
+        let stream = self.scan_partition_at(
+            location,
+            partition_id,
+            range,
+            projection,
+            predicate,
+            batch_size,
+            limit,
+            elapsed_compute,
+        )?;
+        fragment
+            .execute_stream(stream, context)
+            .map_err(anyhow::Error::from)
     }
 }
 
@@ -257,7 +290,7 @@ fn allocate_logical_partitions(
 /// same scan, but each child cannot derive an accurate share of a static table
 /// estimate on its own.
 #[derive(Debug, Clone)]
-struct LocationAwareScanExec {
+pub(crate) struct LocationAwareScanExec {
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     union: Arc<dyn ExecutionPlan>,
     statistics: Arc<Statistics>,
@@ -275,6 +308,49 @@ impl LocationAwareScanExec {
             union,
             statistics,
         }))
+    }
+
+    pub(crate) fn has_remote_branch(&self) -> bool {
+        self.inputs
+            .iter()
+            .any(|input| input.downcast_ref::<RemoteNodeExec>().is_some())
+    }
+
+    pub(crate) fn can_push_partial_aggregate(&self) -> bool {
+        self.inputs.iter().all(|input| {
+            input
+                .downcast_ref::<PartitionScanExec>()
+                .is_some_and(|scan| scan.limit.is_none())
+                || input
+                    .downcast_ref::<RemoteNodeExec>()
+                    .is_some_and(|remote| !remote.has_limit())
+        })
+    }
+
+    pub(crate) fn with_partial_aggregate(
+        &self,
+        fragment: Arc<PartialAggregateFragment>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|input| {
+                if let Some(local) = input.downcast_ref::<PartitionScanExec>() {
+                    fragment.create_partial_exec(Arc::new(local.clone()))
+                } else if let Some(remote) = input.downcast_ref::<RemoteNodeExec>() {
+                    remote.with_partial_aggregate(Arc::clone(&fragment))
+                } else {
+                    Err(DataFusionError::Internal(format!(
+                        "unsupported location-aware scan branch {}",
+                        input.name()
+                    )))
+                }
+            })
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
+        Self::try_new(
+            inputs,
+            Arc::new(Statistics::new_unknown(&fragment.output_schema())),
+        )
     }
 }
 
@@ -521,7 +597,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct PartitionScanExec {
+pub(crate) struct PartitionScanExec {
     location: PartitionLocation,
     logical_partitions: Vec<LogicalPartition>,
     projected_schema: SchemaRef,
@@ -576,57 +652,7 @@ impl ExecutionPlan for PartitionScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-
-        let physical_partitions = self
-            .logical_partitions
-            .get(partition)
-            .expect("partition exists")
-            .physical_partitions
-            .to_vec();
-
-        let sequential_scanners_stream = stream::iter(physical_partitions)
-            .map({
-                let scanner = Arc::clone(&self.scanner);
-                let schema = self.projected_schema.clone();
-                let limit = self.limit;
-                let predicate = datafusion::physical_expr::conjunction_opt(
-                    [
-                        self.static_predicate.clone(),
-                        self.dynamic_predicate.clone(),
-                    ]
-                    .into_iter()
-                    .flatten(),
-                );
-                let location = self.location;
-                let batch_size = context.session_config().batch_size();
-                let elapsed_compute = baseline_metrics.elapsed_compute().clone();
-                move |(partition_id, partition)| {
-                    scanner
-                        .scan_partition_at(
-                            location,
-                            partition_id,
-                            partition.key_range,
-                            schema.clone(),
-                            predicate.clone(),
-                            batch_size,
-                            limit,
-                            elapsed_compute.clone(),
-                        )
-                        .map_err(|e| DataFusionError::External(e.into()))
-                }
-            })
-            .try_flatten();
-
-        let metered = MeteredStream {
-            inner: sequential_scanners_stream,
-            baseline_metrics,
-        };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.projected_schema.clone(),
-            metered,
-        )))
+        self.execute_with_partial_aggregate(partition, context, None)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -676,6 +702,85 @@ impl ExecutionPlan for PartitionScanExec {
     }
 }
 
+impl PartitionScanExec {
+    fn execute_with_partial_aggregate(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+        fragment: Option<Arc<PartialAggregateFragment>>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+
+        let physical_partitions = self
+            .logical_partitions
+            .get(partition)
+            .expect("partition exists")
+            .physical_partitions
+            .to_vec();
+
+        let sequential_scanners_stream = stream::iter(physical_partitions)
+            .map({
+                let scanner = Arc::clone(&self.scanner);
+                let schema = self.projected_schema.clone();
+                let limit = self.limit;
+                let predicate = datafusion::physical_expr::conjunction_opt(
+                    [
+                        self.static_predicate.clone(),
+                        self.dynamic_predicate.clone(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+                let location = self.location;
+                let batch_size = context.session_config().batch_size();
+                let elapsed_compute = baseline_metrics.elapsed_compute().clone();
+                let fragment = fragment.clone();
+                let context = Arc::clone(&context);
+                move |(partition_id, partition)| {
+                    if let Some(fragment) = &fragment {
+                        scanner.scan_partition_at_with_partial_aggregate(
+                            location,
+                            partition_id,
+                            partition.key_range,
+                            schema.clone(),
+                            predicate.clone(),
+                            batch_size,
+                            limit,
+                            elapsed_compute.clone(),
+                            Arc::clone(fragment),
+                            Arc::clone(&context),
+                        )
+                    } else {
+                        scanner.scan_partition_at(
+                            location,
+                            partition_id,
+                            partition.key_range,
+                            schema.clone(),
+                            predicate.clone(),
+                            batch_size,
+                            limit,
+                            elapsed_compute.clone(),
+                        )
+                    }
+                    .map_err(|e| DataFusionError::External(e.into()))
+                }
+            })
+            .try_flatten();
+
+        let metered = MeteredStream {
+            inner: sequential_scanners_stream,
+            baseline_metrics,
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            fragment
+                .map(|fragment| fragment.output_schema())
+                .unwrap_or_else(|| self.projected_schema.clone()),
+            metered,
+        )))
+    }
+}
+
 /// An explicit physical-plan boundary for work assigned to another node.
 ///
 /// The scan is deliberately opaque to DataFusion's default optimizer rules: an
@@ -686,6 +791,7 @@ impl ExecutionPlan for PartitionScanExec {
 pub(crate) struct RemoteNodeExec {
     target_node: NodeId,
     scan: PartitionScanExec,
+    partial_aggregate: Option<Arc<PartialAggregateFragment>>,
     plan: Arc<PlanProperties>,
 }
 
@@ -695,8 +801,31 @@ impl RemoteNodeExec {
         Self {
             target_node,
             scan,
+            partial_aggregate: None,
             plan,
         }
+    }
+
+    pub(crate) fn has_limit(&self) -> bool {
+        self.scan.limit.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_partial_aggregate(&self) -> bool {
+        self.partial_aggregate.is_some()
+    }
+
+    pub(crate) fn with_partial_aggregate(
+        &self,
+        fragment: Arc<PartialAggregateFragment>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let partial = fragment.create_partial_exec(Arc::new(self.scan.clone()))?;
+        Ok(Arc::new(Self {
+            target_node: self.target_node,
+            scan: self.scan.clone(),
+            partial_aggregate: Some(fragment),
+            plan: partial.properties().clone(),
+        }))
     }
 }
 
@@ -731,14 +860,19 @@ impl ExecutionPlan for RemoteNodeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        self.scan.execute(partition, context)
+        self.scan
+            .execute_with_partial_aggregate(partition, context, self.partial_aggregate.clone())
     }
 
     fn partition_statistics(
         &self,
         partition: Option<usize>,
     ) -> datafusion::common::Result<Arc<Statistics>> {
-        self.scan.partition_statistics(partition)
+        if self.partial_aggregate.is_some() {
+            Ok(Arc::new(Statistics::new_unknown(&self.schema())))
+        } else {
+            self.scan.partition_statistics(partition)
+        }
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -751,6 +885,16 @@ impl ExecutionPlan for RemoteNodeExec {
         child_pushdown_result: datafusion::physical_plan::filter_pushdown::ChildPushdownResult,
         config: &datafusion::config::ConfigOptions,
     ) -> datafusion::common::Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        if self.partial_aggregate.is_some() {
+            return Ok(FilterPushdownPropagation {
+                filters: child_pushdown_result
+                    .parent_filters
+                    .iter()
+                    .map(|_| PushedDown::No)
+                    .collect(),
+                updated_node: None,
+            });
+        }
         let propagation =
             self.scan
                 .handle_child_pushdown_result(phase, child_pushdown_result, config)?;
@@ -759,7 +903,12 @@ impl ExecutionPlan for RemoteNodeExec {
                 .downcast_ref::<PartitionScanExec>()
                 .expect("PartitionScanExec updates preserve their type")
                 .clone();
-            Arc::new(Self::new(self.target_node, updated_scan)) as Arc<dyn ExecutionPlan>
+            let mut updated = Self::new(self.target_node, updated_scan);
+            updated
+                .partial_aggregate
+                .clone_from(&self.partial_aggregate);
+            updated.plan = self.plan.clone();
+            Arc::new(updated) as Arc<dyn ExecutionPlan>
         });
 
         Ok(FilterPushdownPropagation {
@@ -773,10 +922,18 @@ impl DisplayAs for RemoteNodeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "RemoteNodeExec: target_node={}", self.target_node)
+                write!(f, "RemoteNodeExec: target_node={}", self.target_node)?;
+                if self.partial_aggregate.is_some() {
+                    write!(f, ", fragment=PartialAggregate")?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
-                writeln!(f, "target_node={}", self.target_node)
+                writeln!(f, "target_node={}", self.target_node)?;
+                if self.partial_aggregate.is_some() {
+                    writeln!(f, "fragment=PartialAggregate")?;
+                }
+                Ok(())
             }
         }
     }

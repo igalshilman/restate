@@ -30,6 +30,7 @@ use restate_types::net::remote_query_scanner::{
 };
 
 use crate::context::QueryContext;
+use crate::partial_aggregation::PartialAggregateFragment;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::remote_query_scanner_server::ScannerMap;
 use crate::{decode_expr, decode_schema, encode_record_batch};
@@ -79,7 +80,7 @@ impl ScannerTask {
         peer: GenerationalNodeId,
         scanners: &Arc<ScannerMap>,
         request: RemoteQueryScannerOpen,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if let Some(expected_owner) = request.expected_partition_owner {
             remote_scanner_manager
                 .validate_local_partition_owner(request.partition_id, expected_owner)?;
@@ -98,6 +99,16 @@ impl ScannerTask {
 
         let schema = Arc::new(schema);
 
+        let partial_aggregate = request.partial_aggregate.as_ref().and_then(|wire| {
+            match PartialAggregateFragment::from_wire(wire, &ctx, &schema) {
+                Ok(fragment) => fragment,
+                Err(error) => {
+                    warn!("Declining partial aggregate for scanner {scanner_id}: {error}");
+                    None
+                }
+            }
+        });
+
         let dynamic_filter = predicate
             .as_ref()
             .map(|pred| Arc::new(DynamicFilterPhysicalExpr::new(Vec::new(), Arc::clone(pred))));
@@ -115,6 +126,12 @@ impl ScannerTask {
                 .map(|limit| usize::try_from(limit).expect("limit to fit in a usize")),
             Time::new(),
         )?;
+        let partial_aggregate_applied = partial_aggregate.is_some();
+        let stream = if let Some(fragment) = partial_aggregate {
+            fragment.execute_stream(stream, Arc::clone(&ctx))?
+        } else {
+            stream
+        };
 
         let (requests, rx) = mpsc::unbounded_channel();
         let (cancel, cancellation) = watch::channel(false);
@@ -143,7 +160,7 @@ impl ScannerTask {
             task.run().await
         })?;
 
-        Ok(())
+        Ok(partial_aggregate_applied)
     }
 
     async fn run(&mut self) {

@@ -43,7 +43,7 @@ use restate_worker_api::{SchedulerStatusEntry, UserLimitCounterEntry};
 
 use super::context::QueryContext;
 use crate::context::{PartitionLeaderStatusHandle, SelectPartitions};
-use crate::remote_query_scanner_client::{RemoteScanner, RemoteScannerService};
+use crate::remote_query_scanner_client::{OpenedRemoteScanner, RemoteScannerService};
 use crate::remote_query_scanner_manager::{
     PartitionLocation, PartitionLocator, RemoteScannerManager,
 };
@@ -173,7 +173,7 @@ impl RemoteScannerService for NoopSvc {
         &self,
         _peer: NodeId,
         _req: RemoteQueryScannerOpen,
-    ) -> Result<RemoteScanner, DataFusionError> {
+    ) -> Result<OpenedRemoteScanner, DataFusionError> {
         panic!("remote service should not be used")
     }
 }

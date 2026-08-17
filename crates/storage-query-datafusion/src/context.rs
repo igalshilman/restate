@@ -47,6 +47,7 @@ use restate_worker_api::{SchedulerStatusEntry, UserLimitCounterEntry};
 
 use crate::empty_invoker_status_handle::EmptyInvokerStatusHandle;
 use crate::node_fan_out::NodeWarnings;
+use crate::partial_aggregation::PartialAggregationPushdown;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 
 type RateLimiter = gardal::SharedTokenBucket<gardal::TokioClock>;
@@ -632,6 +633,7 @@ impl QueryContext {
             .with_config(session_config)
             .with_runtime_env(runtime)
             .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(PartialAggregationPushdown))
             .build();
 
         let mut ctx = SessionContext::new_with_state(state);

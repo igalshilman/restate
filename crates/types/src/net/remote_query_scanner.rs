@@ -71,6 +71,14 @@ pub struct RemoteQueryScannerOpen {
     #[bilrost(tag(9))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_partition_owner: Option<GenerationalNodeId>,
+    /// Optional partial aggregate to apply before returning records. The fragment
+    /// is a DataFusion physical `AggregateExec` with an empty input, restricted
+    /// to the state ABI and aggregate allowlist understood by the receiver.
+    ///
+    /// **Since v1.8**
+    #[bilrost(tag(10))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_aggregate: Option<RemoteQueryScannerPartialAggregate>,
 }
 
 fn default_batch_size() -> u64 {
@@ -84,6 +92,16 @@ pub struct RemoteQueryScannerPredicate {
     // see `encode_expr` / `decode_expr` in storage-query-datafusion/src/lib.rs
     #[bilrost(tag(1), encoding(plainbytes))]
     pub serialized_physical_expression: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, bilrost::Message)]
+pub struct RemoteQueryScannerPartialAggregate {
+    #[bilrost(1)]
+    pub state_abi: u32,
+    #[bilrost(tag(2), encoding(plainbytes))]
+    pub serialized_plan: Vec<u8>,
+    #[bilrost(tag(3), encoding(plainbytes))]
+    pub output_schema_bytes: Vec<u8>,
 }
 
 #[derive(
@@ -102,6 +120,14 @@ pub enum RemoteQueryScannerOpened {
     Success {
         // Client must use this scanner_id for all scanner operations.
         // It can be different from the client minted scanner-id in v1.7
+        scanner_id: ScannerId,
+    },
+    /// The scanner was opened and accepted the requested partial aggregate.
+    /// This is a distinct response variant so the existing `Success` wire shape
+    /// remains compatible with old clients and servers.
+    #[bilrost(tag(2), message)]
+    SuccessWithPartialAggregate {
+        #[bilrost(1)]
         scanner_id: ScannerId,
     },
 }
@@ -237,6 +263,15 @@ mod test {
         scanner_id: Option<ScannerId>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, bilrost::Message, bilrost::Oneof)]
+    enum LegacyRemoteQueryScannerOpened {
+        Failure,
+        #[bilrost(1)]
+        Success {
+            scanner_id: ScannerId,
+        },
+    }
+
     // V1/flexbuffers scanner next result type.
     #[derive(Deserialize)]
     #[allow(dead_code)]
@@ -302,6 +337,11 @@ mod test {
             }),
             scanner_id: Some(scanner_id),
             expected_partition_owner: Some(owner),
+            partial_aggregate: Some(super::RemoteQueryScannerPartialAggregate {
+                state_abi: 1,
+                serialized_plan: vec![7, 8, 9],
+                output_schema_bytes: vec![10, 11, 12],
+            }),
         };
 
         let bilrost_bytes = new_request.encode_to_vec();
@@ -312,6 +352,7 @@ mod test {
 
         let mut request_without_owner = new_request;
         request_without_owner.expected_partition_owner = None;
+        request_without_owner.partial_aggregate = None;
         let legacy_request = LegacyRemoteQueryScannerOpen {
             partition_id: request_without_owner.partition_id,
             range: request_without_owner.range,
@@ -326,9 +367,27 @@ mod test {
             super::RemoteQueryScannerOpen::decode(legacy_request.encode_to_vec().as_slice())
                 .expect("new message should decode the legacy shape");
         assert_eq!(decoded_request.expected_partition_owner, None);
+        assert_eq!(decoded_request.partial_aggregate, None);
         assert_eq!(
             flexbuffers::to_vec(&request_without_owner).expect("new request should serialize"),
             flexbuffers::to_vec(&legacy_request).expect("legacy request should serialize"),
         );
+    }
+
+    #[test]
+    fn partial_aggregate_open_negotiation_is_backward_compatible() {
+        let scanner_id = ScannerId(GenerationalNodeId::new(10, 20), 100);
+        let legacy = LegacyRemoteQueryScannerOpened::Success { scanner_id };
+        let decoded = super::RemoteQueryScannerOpened::decode(legacy.encode_to_vec().as_slice())
+            .expect("new client should decode an old success response");
+        assert_eq!(
+            decoded,
+            super::RemoteQueryScannerOpened::Success { scanner_id }
+        );
+
+        let unchanged = super::RemoteQueryScannerOpened::Success { scanner_id };
+        let decoded = LegacyRemoteQueryScannerOpened::decode(unchanged.encode_to_vec().as_slice())
+            .expect("old client should decode the unchanged success response");
+        assert_eq!(decoded, legacy);
     }
 }

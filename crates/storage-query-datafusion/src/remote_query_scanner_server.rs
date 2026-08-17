@@ -130,7 +130,7 @@ impl RemoteQueryScannerServer {
             return;
         }
 
-        if let Err(e) = ScannerTask::spawn(
+        let partial_aggregate_applied = match ScannerTask::spawn(
             scanner_id,
             query_context,
             remote_scanner_manager,
@@ -138,12 +138,19 @@ impl RemoteQueryScannerServer {
             scanners,
             body,
         ) {
-            warn!("Unable to create a scanner in partition {partition_id}:  {e}");
-            reciprocal.send(RemoteQueryScannerOpened::Failure);
-            return;
-        }
+            Ok(partial_aggregate_applied) => partial_aggregate_applied,
+            Err(e) => {
+                warn!("Unable to create a scanner in partition {partition_id}:  {e}");
+                reciprocal.send(RemoteQueryScannerOpened::Failure);
+                return;
+            }
+        };
 
-        reciprocal.send(RemoteQueryScannerOpened::Success { scanner_id });
+        if partial_aggregate_applied {
+            reciprocal.send(RemoteQueryScannerOpened::SuccessWithPartialAggregate { scanner_id });
+        } else {
+            reciprocal.send(RemoteQueryScannerOpened::Success { scanner_id });
+        }
     }
 
     fn on_next(scanners: &ScannerMap, req: Incoming<Rpc<RemoteQueryScannerNext>>) {

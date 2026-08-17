@@ -29,8 +29,10 @@ use restate_types::net::remote_query_scanner::{RemoteQueryScannerOpen, ScannerId
 use restate_types::sharding::KeyRange;
 use restate_types::{GenerationalNodeId, NodeId};
 
+use crate::partial_aggregation::PartialAggregateFragment;
 use crate::remote_query_scanner_client::{
-    RemoteScanner, RemoteScannerService, remote_scan_as_datafusion_stream,
+    OpenedRemoteScanner, RemoteScannerService, remote_scan_as_datafusion_stream,
+    remote_scan_with_partial_aggregate,
 };
 use crate::table_providers::{Scan, ScanPartition};
 
@@ -139,7 +141,7 @@ impl RemoteScannerService for NoopRemoteScanner {
         &self,
         _peer: NodeId,
         _req: RemoteQueryScannerOpen,
-    ) -> Result<RemoteScanner, DataFusionError> {
+    ) -> Result<OpenedRemoteScanner, DataFusionError> {
         Err(DataFusionError::External(
             anyhow!("remote scanner is not available in local-only mode").into(),
         ))
@@ -372,6 +374,58 @@ impl ScanPartition for RemotePartitionsScanner {
                     batch_size,
                     limit,
                     expected_owner,
+                ))
+            }
+        }
+    }
+
+    fn scan_partition_at_with_partial_aggregate(
+        &self,
+        location: PartitionLocation,
+        partition_id: PartitionId,
+        range: KeyRange,
+        projection: SchemaRef,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
+        batch_size: usize,
+        limit: Option<usize>,
+        elapsed_compute: Time,
+        fragment: Arc<PartialAggregateFragment>,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> anyhow::Result<SendableRecordBatchStream> {
+        match location {
+            PartitionLocation::Local => {
+                let raw = self.scan_partition_at(
+                    location,
+                    partition_id,
+                    range,
+                    projection,
+                    predicate,
+                    batch_size,
+                    limit,
+                    elapsed_compute,
+                )?;
+                Ok(fragment.execute_stream(raw, context)?)
+            }
+            PartitionLocation::Remote { node_id } => {
+                let scanner_id = self.manager.allocate_scanner_id();
+                let expected_owner = match node_id {
+                    NodeId::Generational(node_id) => Some(node_id),
+                    NodeId::Plain(_) => None,
+                };
+                Ok(remote_scan_with_partial_aggregate(
+                    self.manager.remote_scanner.clone(),
+                    node_id,
+                    scanner_id,
+                    partition_id,
+                    range,
+                    self.table_name.clone(),
+                    projection,
+                    predicate,
+                    batch_size,
+                    limit,
+                    expected_owner,
+                    fragment,
+                    context,
                 ))
             }
         }
