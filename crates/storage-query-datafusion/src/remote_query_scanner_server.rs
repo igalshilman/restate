@@ -88,7 +88,9 @@ impl RemoteQueryScannerServer {
                         ServiceMessage::Rpc(msg) if msg.msg_type() == RemoteQueryScannerClose::TYPE => {
                             let close_req = msg.into_typed::<RemoteQueryScannerClose>();
                             let (reciprocal, close_req) = close_req.split();
-                            scanners.remove(&close_req.scanner_id);
+                            if let Some((_, scanner)) = scanners.remove(&close_req.scanner_id) {
+                                scanner.cancel();
+                            }
                             let res = RemoteQueryScannerClosed {
                                 scanner_id: close_req.scanner_id,
                             };

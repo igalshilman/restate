@@ -31,8 +31,10 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
     SendableRecordBatchStream,
 };
+use datafusion::physical_plan::{empty::EmptyExec, union::UnionExec};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 
+use restate_types::NodeId;
 use restate_types::identifiers::PartitionId;
 use restate_types::partition_table::Partition;
 use restate_types::sharding::KeyRange;
@@ -41,7 +43,22 @@ use crate::context::SelectPartitions;
 use crate::filter::{FirstMatchingPartitionKeyExtractor, PointReadFanout};
 use crate::table_util::{find_sort_columns, make_ordering};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionLocation {
+    Local,
+    Remote { node_id: NodeId },
+}
+
 pub trait ScanPartition: Send + Sync + Debug + 'static {
+    /// Resolves where a partition will be scanned while the physical plan is built.
+    ///
+    /// Implementations that only scan local data can use the default. Distributed
+    /// scanners override this and must treat the returned location as fixed for the
+    /// lifetime of the physical plan.
+    fn partition_location(&self, _partition_id: PartitionId) -> anyhow::Result<PartitionLocation> {
+        Ok(PartitionLocation::Local)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn scan_partition(
         &self,
@@ -53,20 +70,50 @@ pub trait ScanPartition: Send + Sync + Debug + 'static {
         limit: Option<usize>,
         elapsed_compute: Time,
     ) -> anyhow::Result<SendableRecordBatchStream>;
+
+    /// Scans a partition at the location selected by [`Self::partition_location`].
+    ///
+    /// The default is suitable for local-only scanners. A distributed scanner must
+    /// override this method so execution cannot silently choose a different owner.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_partition_at(
+        &self,
+        location: PartitionLocation,
+        partition_id: PartitionId,
+        range: KeyRange,
+        projection: SchemaRef,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
+        batch_size: usize,
+        limit: Option<usize>,
+        elapsed_compute: Time,
+    ) -> anyhow::Result<SendableRecordBatchStream> {
+        if location != PartitionLocation::Local {
+            anyhow::bail!("local scanner cannot execute a remote partition");
+        }
+        self.scan_partition(
+            partition_id,
+            range,
+            projection,
+            predicate,
+            batch_size,
+            limit,
+            elapsed_compute,
+        )
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct PartitionedTableProvider<T, S> {
+pub(crate) struct PartitionedTableProvider<S> {
     partition_selector: S,
     schema: SchemaRef,
     ordering: Vec<String>,
-    partition_scanner: T,
+    partition_scanner: Arc<dyn ScanPartition>,
     partition_key_extractor: FirstMatchingPartitionKeyExtractor,
     statistics: Statistics,
 }
 
-impl<T, S> PartitionedTableProvider<T, S> {
-    pub(crate) fn new(
+impl<S> PartitionedTableProvider<S> {
+    pub(crate) fn new<T: ScanPartition>(
         partition_selector: S,
         schema: SchemaRef,
         ordering: Vec<String>,
@@ -78,7 +125,7 @@ impl<T, S> PartitionedTableProvider<T, S> {
             partition_selector,
             schema,
             ordering,
-            partition_scanner,
+            partition_scanner: Arc::new(partition_scanner),
             partition_key_extractor,
             statistics,
         }
@@ -128,10 +175,169 @@ fn physical_partitions_to_logical(
     logical_partitions
 }
 
+#[derive(Debug)]
+struct LocatedPartitions {
+    location: PartitionLocation,
+    physical_partitions: Vec<(PartitionId, Partition)>,
+}
+
+fn group_partitions_by_location(
+    scanner: &dyn ScanPartition,
+    physical_partitions: Vec<(PartitionId, Partition)>,
+) -> anyhow::Result<Vec<LocatedPartitions>> {
+    let mut groups: Vec<LocatedPartitions> = Vec::new();
+
+    for physical_partition @ (partition_id, _) in physical_partitions {
+        let location = scanner.partition_location(partition_id)?;
+        if let Some(group) = groups.iter_mut().find(|group| group.location == location) {
+            group.physical_partitions.push(physical_partition);
+        } else {
+            groups.push(LocatedPartitions {
+                location,
+                physical_partitions: vec![physical_partition],
+            });
+        }
+    }
+
+    Ok(groups)
+}
+
+fn allocate_logical_partitions(
+    groups: Vec<LocatedPartitions>,
+    target_partitions: usize,
+) -> Vec<(PartitionLocation, Vec<LogicalPartition>)> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+
+    // Every placement needs at least one execution lane so a logical partition
+    // never crosses an RPC boundary. Distribute the remaining session parallelism
+    // across placements without exceeding the number of physical scans in a group.
+    let desired_lanes = target_partitions.max(groups.len()).min(
+        groups
+            .iter()
+            .map(|group| group.physical_partitions.len())
+            .sum(),
+    );
+    let mut lane_counts = vec![1; groups.len()];
+    let mut remaining = desired_lanes.saturating_sub(groups.len());
+    while remaining > 0 {
+        let mut allocated = false;
+        for (group, lanes) in groups.iter().zip(&mut lane_counts) {
+            if *lanes < group.physical_partitions.len() {
+                *lanes += 1;
+                remaining -= 1;
+                allocated = true;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        if !allocated {
+            break;
+        }
+    }
+
+    groups
+        .into_iter()
+        .zip(lane_counts)
+        .map(|(group, lanes)| {
+            (
+                group.location,
+                physical_partitions_to_logical(group.physical_partitions, lanes),
+            )
+        })
+        .collect()
+}
+
+/// Combines the location-specific branches of one table scan.
+///
+/// This deliberately reports the table's original statistics instead of
+/// summing its children: the children are disjoint placement fragments of the
+/// same scan, but each child cannot derive an accurate share of a static table
+/// estimate on its own.
+#[derive(Debug, Clone)]
+struct LocationAwareScanExec {
+    inputs: Vec<Arc<dyn ExecutionPlan>>,
+    union: Arc<dyn ExecutionPlan>,
+    statistics: Arc<Statistics>,
+}
+
+impl LocationAwareScanExec {
+    fn try_new(
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        statistics: Arc<Statistics>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        debug_assert!(inputs.len() > 1);
+        let union = UnionExec::try_new(inputs.clone())?;
+        Ok(Arc::new(Self {
+            inputs,
+            union,
+            statistics,
+        }))
+    }
+}
+
+impl ExecutionPlan for LocationAwareScanExec {
+    fn name(&self) -> &str {
+        "LocationAwareScanExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.union.properties()
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        self.union.maintains_input_order()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        self.union.benefits_from_input_partitioning()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.inputs.iter().collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        Self::try_new(children, self.statistics.clone())
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        self.union.execute(partition, context)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.union.metrics()
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion::common::Result<Arc<Statistics>> {
+        match partition {
+            Some(partition) => self.union.partition_statistics(Some(partition)),
+            None => Ok(self.statistics.clone()),
+        }
+    }
+}
+
+impl DisplayAs for LocationAwareScanExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        write!(f, "LocationAwareScanExec")
+    }
+}
+
 #[async_trait]
-impl<T, S> TableProvider for PartitionedTableProvider<T, S>
+impl<S> TableProvider for PartitionedTableProvider<S>
 where
-    T: ScanPartition + Clone,
     S: SelectPartitions,
 {
     fn schema(&self) -> SchemaRef {
@@ -172,7 +378,7 @@ where
             .try_extract_selection(&filters)
             .map_err(|e| DataFusionError::External(e.into()))?;
 
-        let predicate = datafusion::physical_expr::conjunction_opt(filters);
+        let static_predicate = datafusion::physical_expr::conjunction_opt(filters);
 
         let physical_partitions: Vec<(PartitionId, Partition)> = self
             .partition_selector
@@ -233,9 +439,15 @@ where
             })
             .collect();
 
-        let target_partitions = state.config().target_partitions();
-        let logical_partitions =
-            physical_partitions_to_logical(physical_partitions, target_partitions);
+        let located_partitions =
+            group_partitions_by_location(self.partition_scanner.as_ref(), physical_partitions)
+                .map_err(|error| DataFusionError::External(error.into()))?;
+        let located_partitions =
+            allocate_logical_partitions(located_partitions, state.config().target_partitions());
+
+        if located_partitions.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        }
 
         let sort_columns = find_sort_columns(&self.ordering, &projected_schema);
 
@@ -246,27 +458,49 @@ where
             EquivalenceProperties::new_with_orderings(projected_schema.clone(), [ordering])
         };
 
-        let plan = PlanProperties::new(
-            eq_properties,
-            Partitioning::UnknownPartitioning(logical_partitions.len()),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        )
-        .with_scheduling_type(
-            // all our scan functions use RecordBatchReceiverStream to build the result, which is cooperative
-            datafusion::physical_plan::execution_plan::SchedulingType::Cooperative,
-        );
+        let statistics = Arc::new(self.statistics.clone().project(projection));
+        let branch_statistics = if located_partitions.len() == 1 {
+            statistics.clone()
+        } else {
+            Arc::new(Statistics::new_unknown(&projected_schema))
+        };
+        let mut inputs = Vec::with_capacity(located_partitions.len());
+        for (location, logical_partitions) in located_partitions {
+            let plan = PlanProperties::new(
+                eq_properties.clone(),
+                Partitioning::UnknownPartitioning(logical_partitions.len()),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )
+            .with_scheduling_type(
+                datafusion::physical_plan::execution_plan::SchedulingType::Cooperative,
+            );
 
-        Ok(Arc::new(PartitionedExecutionPlan {
-            logical_partitions,
-            projected_schema,
-            limit,
-            predicate,
-            scanner: self.partition_scanner.clone(),
-            plan: Arc::new(plan),
-            statistics: Arc::new(self.statistics.clone().project(projection)),
-            metrics: ExecutionPlanMetricsSet::new(),
-        }))
+            let scan = PartitionScanExec {
+                location,
+                logical_partitions,
+                projected_schema: projected_schema.clone(),
+                limit,
+                static_predicate: static_predicate.clone(),
+                dynamic_predicate: None,
+                scanner: Arc::clone(&self.partition_scanner),
+                plan: Arc::new(plan),
+                statistics: branch_statistics.clone(),
+                metrics: ExecutionPlanMetricsSet::new(),
+            };
+
+            inputs.push(match location {
+                PartitionLocation::Local => Arc::new(scan) as Arc<dyn ExecutionPlan>,
+                PartitionLocation::Remote { node_id } => {
+                    Arc::new(RemoteNodeExec::new(node_id, scan)) as Arc<dyn ExecutionPlan>
+                }
+            });
+        }
+
+        match inputs.len() {
+            1 => Ok(inputs.pop().expect("one scan input")),
+            _ => LocationAwareScanExec::try_new(inputs, statistics),
+        }
     }
 
     fn supports_filters_pushdown(
@@ -287,23 +521,22 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct PartitionedExecutionPlan<T> {
+struct PartitionScanExec {
+    location: PartitionLocation,
     logical_partitions: Vec<LogicalPartition>,
     projected_schema: SchemaRef,
     limit: Option<usize>,
-    predicate: Option<Arc<dyn PhysicalExpr>>,
-    scanner: T,
+    static_predicate: Option<Arc<dyn PhysicalExpr>>,
+    dynamic_predicate: Option<Arc<dyn PhysicalExpr>>,
+    scanner: Arc<dyn ScanPartition>,
     plan: Arc<PlanProperties>,
     statistics: Arc<Statistics>,
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl<T> ExecutionPlan for PartitionedExecutionPlan<T>
-where
-    T: ScanPartition + Clone + Send,
-{
+impl ExecutionPlan for PartitionScanExec {
     fn name(&self) -> &str {
-        "PartitionedExecutionPlan"
+        "PartitionScanExec"
     }
 
     fn schema(&self) -> SchemaRef {
@@ -324,7 +557,7 @@ where
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         if !new_children.is_empty() {
             return Err(DataFusionError::Internal(
-                "PartitionedExecutionPlan does not support children".to_owned(),
+                "PartitionScanExec does not support children".to_owned(),
             ));
         }
 
@@ -354,15 +587,24 @@ where
 
         let sequential_scanners_stream = stream::iter(physical_partitions)
             .map({
-                let scanner = self.scanner.clone();
+                let scanner = Arc::clone(&self.scanner);
                 let schema = self.projected_schema.clone();
                 let limit = self.limit;
-                let predicate = self.predicate.clone();
+                let predicate = datafusion::physical_expr::conjunction_opt(
+                    [
+                        self.static_predicate.clone(),
+                        self.dynamic_predicate.clone(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+                let location = self.location;
                 let batch_size = context.session_config().batch_size();
                 let elapsed_compute = baseline_metrics.elapsed_compute().clone();
                 move |(partition_id, partition)| {
                     scanner
-                        .scan_partition(
+                        .scan_partition_at(
+                            location,
                             partition_id,
                             partition.key_range,
                             schema.clone(),
@@ -407,7 +649,7 @@ where
 
         // As in the static case above, the predicate *should* have the correct column indices,
         // but bugs in datafusion can create mixups.
-        let mut filters: Vec<_> = child_pushdown_result
+        let filters: Vec<_> = child_pushdown_result
             .parent_filters
             .iter()
             .map(|f| {
@@ -418,13 +660,9 @@ where
             })
             .collect::<Result<_, _>>()?;
 
-        if let Some(predicate) = &self.predicate {
-            filters.push(predicate.clone());
-        }
-
         let predicate = datafusion::physical_expr::conjunction(filters);
         let mut plan = self.clone();
-        plan.predicate = Some(predicate);
+        plan.dynamic_predicate = Some(predicate);
 
         Ok(FilterPushdownPropagation {
             // we report all filters as unsupported as we don't guarantee to apply them exactly as there can be a delay before new filters are used
@@ -438,22 +676,129 @@ where
     }
 }
 
-impl<T> DisplayAs for PartitionedExecutionPlan<T>
-where
-    T: Debug,
-{
+/// An explicit physical-plan boundary for work assigned to another node.
+///
+/// The scan is deliberately opaque to DataFusion's default optimizer rules: an
+/// operator must only appear inside this boundary once `RemoteNodeExec` knows how
+/// to serialize and execute it remotely. Custom rules can match and enrich this
+/// node without rediscovering placement.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteNodeExec {
+    target_node: NodeId,
+    scan: PartitionScanExec,
+    plan: Arc<PlanProperties>,
+}
+
+impl RemoteNodeExec {
+    fn new(target_node: NodeId, scan: PartitionScanExec) -> Self {
+        let plan = scan.properties().clone();
+        Self {
+            target_node,
+            scan,
+            plan,
+        }
+    }
+}
+
+impl ExecutionPlan for RemoteNodeExec {
+    fn name(&self) -> &str {
+        "RemoteNodeExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.plan
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        new_children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if !new_children.is_empty() {
+            return Err(DataFusionError::Internal(format!(
+                "RemoteNodeExec does not support children, got {}",
+                new_children.len()
+            )));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        self.scan.execute(partition, context)
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion::common::Result<Arc<Statistics>> {
+        self.scan.partition_statistics(partition)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.scan.metrics()
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: datafusion::physical_plan::filter_pushdown::ChildPushdownResult,
+        config: &datafusion::config::ConfigOptions,
+    ) -> datafusion::common::Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let propagation =
+            self.scan
+                .handle_child_pushdown_result(phase, child_pushdown_result, config)?;
+        let updated_node = propagation.updated_node.map(|updated_scan| {
+            let updated_scan = updated_scan
+                .downcast_ref::<PartitionScanExec>()
+                .expect("PartitionScanExec updates preserve their type")
+                .clone();
+            Arc::new(Self::new(self.target_node, updated_scan)) as Arc<dyn ExecutionPlan>
+        });
+
+        Ok(FilterPushdownPropagation {
+            filters: propagation.filters,
+            updated_node,
+        })
+    }
+}
+
+impl DisplayAs for RemoteNodeExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "RemoteNodeExec: target_node={}", self.target_node)
+            }
+            DisplayFormatType::TreeRender => {
+                writeln!(f, "target_node={}", self.target_node)
+            }
+        }
+    }
+}
+
+impl DisplayAs for PartitionScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "PartitionedExecutionPlan: scanner={:?}, partitions={}, projection=[{}]",
+                    "PartitionScanExec: location={:?}, scanner={:?}, partitions={}, projection=[{}]",
+                    self.location,
                     self.scanner,
                     self.logical_partitions.len(),
                     ProjectedColumns(&self.projected_schema),
                 )?;
-                if let Some(predicate) = &self.predicate {
-                    write!(f, ", predicate={predicate}")?;
+                if let Some(predicate) = &self.static_predicate {
+                    write!(f, ", static_predicate={predicate}")?;
+                }
+                if let Some(predicate) = &self.dynamic_predicate {
+                    write!(f, ", dynamic_predicate={predicate}")?;
                 }
                 if let Some(limit) = self.limit {
                     write!(f, ", limit={limit}")?;
@@ -461,6 +806,7 @@ where
                 Ok(())
             }
             DisplayFormatType::TreeRender => {
+                writeln!(f, "location={:?}", self.location)?;
                 writeln!(f, "scanner={:?}", self.scanner)?;
                 writeln!(f, "partitions={}", self.logical_partitions.len())?;
                 writeln!(
@@ -468,8 +814,11 @@ where
                     "projection=[{}]",
                     ProjectedColumns(&self.projected_schema)
                 )?;
-                if let Some(predicate) = &self.predicate {
-                    writeln!(f, "predicate={predicate}")?;
+                if let Some(predicate) = &self.static_predicate {
+                    writeln!(f, "static_predicate={predicate}")?;
+                }
+                if let Some(predicate) = &self.dynamic_predicate {
+                    writeln!(f, "dynamic_predicate={predicate}")?;
                 }
                 if let Some(limit) = self.limit {
                     writeln!(f, "limit={limit}")?;
@@ -751,5 +1100,205 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = self.inner.poll_next_unpin(cx);
         self.baseline_metrics.record_poll(poll)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::stats::Precision;
+    use datafusion::config::ConfigOptions;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::physical_expr::PhysicalSortExpr;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use restate_types::GenerationalNodeId;
+    use restate_types::errors::GenericError;
+
+    use super::*;
+
+    fn physical_partition(id: u16) -> (PartitionId, Partition) {
+        let partition_id = PartitionId::new_unchecked(id);
+        (partition_id, Partition::new(partition_id, KeyRange::FULL))
+    }
+
+    #[test]
+    fn logical_partitions_never_cross_planned_locations() {
+        let remote_one = PartitionLocation::Remote {
+            node_id: GenerationalNodeId::new(2, 1).into(),
+        };
+        let remote_two = PartitionLocation::Remote {
+            node_id: GenerationalNodeId::new(3, 1).into(),
+        };
+        let groups = vec![
+            LocatedPartitions {
+                location: PartitionLocation::Local,
+                physical_partitions: (0..6).map(physical_partition).collect(),
+            },
+            LocatedPartitions {
+                location: remote_one,
+                physical_partitions: (6..9).map(physical_partition).collect(),
+            },
+            LocatedPartitions {
+                location: remote_two,
+                physical_partitions: vec![physical_partition(9)],
+            },
+        ];
+
+        let allocated = allocate_logical_partitions(groups, 4);
+        assert_eq!(allocated.len(), 3);
+        assert_eq!(
+            allocated
+                .iter()
+                .map(|(_, partitions)| partitions.len())
+                .sum::<usize>(),
+            4
+        );
+        assert_eq!(allocated[0].1.len(), 2);
+        assert_eq!(allocated[1].1.len(), 1);
+        assert_eq!(allocated[2].1.len(), 1);
+
+        let mut partition_ids = allocated
+            .iter()
+            .flat_map(|(_, logical)| logical)
+            .flat_map(|logical| &logical.physical_partitions)
+            .map(|(partition_id, _)| *partition_id)
+            .collect::<Vec<_>>();
+        partition_ids.sort_unstable();
+        assert_eq!(
+            partition_ids,
+            (0..10).map(PartitionId::new_unchecked).collect::<Vec<_>>()
+        );
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestPartitionSelector;
+
+    #[async_trait]
+    impl SelectPartitions for TestPartitionSelector {
+        async fn get_live_partitions(&self) -> Result<Vec<(PartitionId, Partition)>, GenericError> {
+            Ok((0..4).map(physical_partition).collect())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestPartitionScanner;
+
+    impl ScanPartition for TestPartitionScanner {
+        fn partition_location(
+            &self,
+            partition_id: PartitionId,
+        ) -> anyhow::Result<PartitionLocation> {
+            if partition_id == PartitionId::MIN {
+                Ok(PartitionLocation::Local)
+            } else {
+                Ok(PartitionLocation::Remote {
+                    node_id: GenerationalNodeId::new(2, 1).into(),
+                })
+            }
+        }
+
+        fn scan_partition(
+            &self,
+            _partition_id: PartitionId,
+            _range: KeyRange,
+            _projection: SchemaRef,
+            _predicate: Option<Arc<dyn PhysicalExpr>>,
+            _batch_size: usize,
+            _limit: Option<usize>,
+            _elapsed_compute: Time,
+        ) -> anyhow::Result<SendableRecordBatchStream> {
+            unreachable!("plan-shape test does not execute the scan")
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_plan_has_an_explicit_remote_node() {
+        let schema = Arc::new(Schema::empty());
+        let provider = PartitionedTableProvider::new(
+            TestPartitionSelector,
+            schema.clone(),
+            Vec::new(),
+            TestPartitionScanner,
+            FirstMatchingPartitionKeyExtractor::default(),
+        )
+        .with_statistics(Statistics::new_unknown(&schema).with_num_rows(Precision::Inexact(1024)));
+        let context = SessionContext::new();
+
+        let plan = provider
+            .scan(&context.state(), None, &[], None)
+            .await
+            .expect("physical plan should build");
+        let scan = plan
+            .downcast_ref::<LocationAwareScanExec>()
+            .expect("local and remote placements should form one scan");
+        assert_eq!(scan.children().len(), 2);
+        assert_eq!(
+            scan.partition_statistics(None)
+                .expect("statistics should be available")
+                .num_rows,
+            Precision::Inexact(1024)
+        );
+
+        let remote = scan
+            .children()
+            .into_iter()
+            .find_map(|child| child.downcast_ref::<RemoteNodeExec>())
+            .expect("remote placement should have an explicit boundary");
+        assert_eq!(
+            remote.target_node,
+            NodeId::from(GenerationalNodeId::new(2, 1))
+        );
+        assert!(remote.children().is_empty());
+        assert_eq!(remote.scan.name(), "PartitionScanExec");
+    }
+
+    #[tokio::test]
+    async fn topk_dynamic_filter_reaches_the_remote_scan() {
+        let provider = PartitionedTableProvider::new(
+            TestPartitionSelector,
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            Vec::new(),
+            TestPartitionScanner,
+            FirstMatchingPartitionKeyExtractor::default(),
+        );
+        let context = SessionContext::new();
+        let scan = provider
+            .scan(&context.state(), None, &[], None)
+            .await
+            .expect("physical plan should build");
+        let sort = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr::new_default(Arc::new(Column::new(
+                    "value", 0,
+                )))]
+                .into(),
+                scan,
+            )
+            .with_fetch(Some(10)),
+        );
+        let mut config = ConfigOptions::new();
+        config.optimizer.enable_topk_dynamic_filter_pushdown = true;
+
+        let optimized = FilterPushdown::new_post_optimization()
+            .optimize(sort, &config)
+            .expect("TopK filter pushdown should succeed");
+        let scan = optimized.children()[0]
+            .downcast_ref::<LocationAwareScanExec>()
+            .expect("sort input should remain a location-aware scan");
+        let remote = scan
+            .children()
+            .into_iter()
+            .find_map(|child| child.downcast_ref::<RemoteNodeExec>())
+            .expect("remote boundary should remain explicit");
+
+        assert!(remote.scan.static_predicate.is_none());
+        assert!(remote.scan.dynamic_predicate.is_some());
     }
 }

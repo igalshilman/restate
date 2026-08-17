@@ -9,20 +9,23 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt::{Debug, Formatter};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion::physical_expr_common::physical_expr::snapshot_generation;
 use datafusion::physical_plan::PhysicalExpr;
-use datafusion::physical_plan::stream::RecordBatchReceiverStream;
+use futures::future::BoxFuture;
+use futures::stream::Stream;
 use tracing::debug;
 
 use restate_core::network::{Connection, NetworkSender, Networking, Swimlane, TransportConnect};
 use restate_core::{TaskCenter, TaskCenterFutureExt, TaskKind, task_center};
-use restate_types::NodeId;
 use restate_types::identifiers::PartitionId;
 use restate_types::net::remote_query_scanner::{
     RemoteQueryScannerClose, RemoteQueryScannerNext, RemoteQueryScannerNextResult,
@@ -30,6 +33,7 @@ use restate_types::net::remote_query_scanner::{
     ScannerFailure, ScannerId,
 };
 use restate_types::sharding::KeyRange;
+use restate_types::{GenerationalNodeId, NodeId};
 
 use crate::{decode_record_batch, encode_expr, encode_schema};
 
@@ -159,81 +163,176 @@ pub fn remote_scan_as_datafusion_stream(
     predicate: Option<Arc<dyn PhysicalExpr>>,
     batch_size: usize,
     limit: Option<usize>,
+    expected_partition_owner: Option<GenerationalNodeId>,
 ) -> SendableRecordBatchStream {
-    let mut builder = RecordBatchReceiverStream::builder(projection_schema.clone(), 1);
-
-    let tx = builder.tx();
-
-    let task = async move {
-        // get a snapshot of the initial predicate
-        let mut predicate_generation = predicate.as_ref().map(snapshot_generation).unwrap_or(0);
-
-        let initial_predicate = match &predicate {
-            Some(predicate) => Some(RemoteQueryScannerPredicate {
-                serialized_physical_expression: encode_expr(predicate)?,
-            }),
-            None => None,
-        };
-
-        let open_request = RemoteQueryScannerOpen {
-            scanner_id: Some(scanner_id),
-            partition_id,
-            range,
-            table: table_name,
-            projection_schema_bytes: encode_schema(&projection_schema),
-            limit: limit.map(|limit| u64::try_from(limit).expect("limit to fit in a u64")),
-            predicate: initial_predicate,
-            batch_size: u64::try_from(batch_size).expect("batch_size to fit in a u64"),
-        };
-
-        // RemoteScanner will auto close on drop. Please call forget() if you don't need this
-        // behaviour.
-        let mut remote_scanner = service.open(target_node_id, open_request).await?;
-        // loop while we have record_batch coming in
-        //
-        loop {
-            let next_predicate = next_predicate(&mut predicate_generation, predicate.as_ref())?;
-
-            let batch = match remote_scanner.next_batch(next_predicate).await {
-                Err(e) => {
-                    return Err(e);
+    let predicate_generation = predicate.as_ref().map(snapshot_generation).unwrap_or(0);
+    let initial_predicate = predicate
+        .as_ref()
+        .map(|predicate| {
+            encode_expr(predicate).map(|serialized_physical_expression| {
+                RemoteQueryScannerPredicate {
+                    serialized_physical_expression,
                 }
-                Ok(RemoteQueryScannerNextResult::Unknown) => {
-                    return Err(DataFusionError::Internal(
-                        "Received unknown scanner result".to_owned(),
-                    ));
-                }
-                Ok(RemoteQueryScannerNextResult::NextBatch(ScannerBatch {
-                    record_batch, ..
-                })) => decode_record_batch(&record_batch)?,
-                Ok(RemoteQueryScannerNextResult::Failure(ScannerFailure { message, .. })) => {
-                    // assume server closed the scanner before responding
-                    remote_scanner.forget();
-                    return Err(DataFusionError::Internal(message));
-                }
-                Ok(RemoteQueryScannerNextResult::NoMoreRecords(_)) => {
-                    // assume server closed the scanner before responding
-                    remote_scanner.forget();
-                    return Ok(());
-                }
-                Ok(RemoteQueryScannerNextResult::NoSuchScanner(_)) => {
-                    remote_scanner.forget();
-                    return Err(DataFusionError::Internal("No such scanner. It could have expired due to a long period of inactivity.".to_string()));
-                }
+            })
+        })
+        .transpose();
+
+    let state = match initial_predicate {
+        Ok(initial_predicate) => {
+            let open_request = RemoteQueryScannerOpen {
+                scanner_id: Some(scanner_id),
+                partition_id,
+                range,
+                table: table_name,
+                projection_schema_bytes: encode_schema(&projection_schema),
+                limit: limit.map(|limit| u64::try_from(limit).expect("limit to fit in a u64")),
+                predicate: initial_predicate,
+                batch_size: u64::try_from(batch_size).expect("batch_size to fit in a u64"),
+                expected_partition_owner,
             };
-
-            let res = tx.send(Ok(batch)).await;
-            if res.is_ok() {
-                continue;
-            }
-            return res
-                .map(|_| ())
-                .map_err(|e| DataFusionError::External(e.into()));
+            RemoteCursorState::Opening(Box::pin(async move {
+                service.open(target_node_id, open_request).await
+            }))
         }
+        Err(error) => RemoteCursorState::Failed(Some(error)),
     };
 
-    builder.spawn(task);
-    builder.build()
+    Box::pin(RemoteCursorStream {
+        schema: projection_schema,
+        predicate,
+        predicate_generation,
+        state,
+    })
+}
+
+enum RemoteCursorState {
+    Opening(BoxFuture<'static, Result<RemoteScanner, DataFusionError>>),
+    Ready(RemoteScanner),
+    Pulling(
+        BoxFuture<
+            'static,
+            (
+                RemoteScanner,
+                Result<RemoteQueryScannerNextResult, DataFusionError>,
+            ),
+        >,
+    ),
+    Failed(Option<DataFusionError>),
+    Done,
+}
+
+struct RemoteCursorStream {
+    schema: SchemaRef,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+    predicate_generation: u64,
+    state: RemoteCursorState,
+}
+
+impl Stream for RemoteCursorStream {
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            match &mut this.state {
+                RemoteCursorState::Opening(open) => match open.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(scanner)) => {
+                        this.state = RemoteCursorState::Ready(scanner);
+                    }
+                    Poll::Ready(Err(error)) => {
+                        this.state = RemoteCursorState::Done;
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                },
+                RemoteCursorState::Ready(_) => {
+                    let next_predicate = match next_predicate(
+                        &mut this.predicate_generation,
+                        this.predicate.as_ref(),
+                    ) {
+                        Ok(next_predicate) => next_predicate,
+                        Err(error) => {
+                            this.state = RemoteCursorState::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    };
+                    let RemoteCursorState::Ready(mut scanner) =
+                        std::mem::replace(&mut this.state, RemoteCursorState::Done)
+                    else {
+                        unreachable!("matched ready cursor state")
+                    };
+                    this.state = RemoteCursorState::Pulling(Box::pin(async move {
+                        let result = scanner.next_batch(next_predicate).await;
+                        (scanner, result)
+                    }));
+                }
+                RemoteCursorState::Pulling(pull) => {
+                    let (scanner, result) = match pull.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result,
+                    };
+
+                    match result {
+                        Ok(RemoteQueryScannerNextResult::NextBatch(ScannerBatch {
+                            record_batch,
+                            ..
+                        })) => match decode_record_batch(&record_batch) {
+                            Ok(batch) => {
+                                this.state = RemoteCursorState::Ready(scanner);
+                                return Poll::Ready(Some(Ok(batch)));
+                            }
+                            Err(error) => {
+                                this.state = RemoteCursorState::Done;
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        },
+                        Ok(RemoteQueryScannerNextResult::NoMoreRecords(_)) => {
+                            scanner.forget();
+                            this.state = RemoteCursorState::Done;
+                            return Poll::Ready(None);
+                        }
+                        Ok(RemoteQueryScannerNextResult::Failure(ScannerFailure {
+                            message,
+                            ..
+                        })) => {
+                            scanner.forget();
+                            this.state = RemoteCursorState::Done;
+                            return Poll::Ready(Some(Err(DataFusionError::Internal(message))));
+                        }
+                        Ok(RemoteQueryScannerNextResult::NoSuchScanner(_)) => {
+                            scanner.forget();
+                            this.state = RemoteCursorState::Done;
+                            return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                "No such scanner. It could have expired due to a long period of inactivity."
+                                    .to_string(),
+                            ))));
+                        }
+                        Ok(RemoteQueryScannerNextResult::Unknown) => {
+                            this.state = RemoteCursorState::Done;
+                            return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                "Received unknown scanner result".to_owned(),
+                            ))));
+                        }
+                        Err(error) => {
+                            this.state = RemoteCursorState::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                }
+                RemoteCursorState::Failed(error) => {
+                    return Poll::Ready(error.take().map(Err));
+                }
+                RemoteCursorState::Done => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
+impl RecordBatchStream for RemoteCursorStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }
 
 fn next_predicate(

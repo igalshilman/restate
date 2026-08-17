@@ -17,7 +17,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::metrics::Time;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{debug, warn};
 
@@ -41,7 +41,21 @@ pub(crate) struct NextRequest {
     pub next_predicate: Option<RemoteQueryScannerPredicate>,
 }
 
-pub(crate) type ScannerHandle = mpsc::UnboundedSender<NextRequest>;
+#[derive(Clone)]
+pub(crate) struct ScannerHandle {
+    requests: mpsc::UnboundedSender<NextRequest>,
+    cancellation: watch::Sender<bool>,
+}
+
+impl ScannerHandle {
+    pub fn send(&self, request: NextRequest) -> Result<(), mpsc::error::SendError<NextRequest>> {
+        self.requests.send(request)
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.cancellation.send(true);
+    }
+}
 
 // Tracks a single scanner's lifecycle running in [`RemoteQueryScannerServer`]
 pub(crate) struct ScannerTask {
@@ -49,6 +63,7 @@ pub(crate) struct ScannerTask {
     scanner_id: ScannerId,
     stream: SendableRecordBatchStream,
     rx: mpsc::UnboundedReceiver<NextRequest>,
+    cancellation: watch::Receiver<bool>,
     scanners: Weak<ScannerMap>,
     ctx: Arc<TaskContext>,
     schema: SchemaRef,
@@ -65,6 +80,11 @@ impl ScannerTask {
         scanners: &Arc<ScannerMap>,
         request: RemoteQueryScannerOpen,
     ) -> anyhow::Result<()> {
+        if let Some(expected_owner) = request.expected_partition_owner {
+            remote_scanner_manager
+                .validate_local_partition_owner(request.partition_id, expected_owner)?;
+        }
+
         let scanner = remote_scanner_manager
             .local_partition_scanner(&request.table)
             .context("not registered scanner for a table")?;
@@ -96,19 +116,27 @@ impl ScannerTask {
             Time::new(),
         )?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (requests, rx) = mpsc::unbounded_channel();
+        let (cancel, cancellation) = watch::channel(false);
         let mut task = Self {
             peer,
             scanner_id,
             stream,
             rx,
+            cancellation,
             scanners: Arc::downgrade(scanners),
             ctx,
             schema,
             dynamic_filter,
         };
 
-        scanners.insert(scanner_id, tx);
+        scanners.insert(
+            scanner_id,
+            ScannerHandle {
+                requests,
+                cancellation: cancel,
+            },
+        );
 
         // make sure we add before we spawn.
         TaskCenter::spawn_unmanaged(TaskKind::DfScanner, "df-scanner-task", async move {
@@ -133,6 +161,10 @@ impl ScannerTask {
                 _ = &mut watch_fut => {
                     // peer is dead, dispose the scanner
                     debug!("Removing scanner due to peer {} being dead", self.peer);
+                    return;
+                }
+                _ = self.cancellation.changed() => {
+                    debug!("Remote scanner {} was cancelled", self.scanner_id);
                     return;
                 }
                 maybe_request = self.rx.recv() => {
@@ -178,7 +210,20 @@ impl ScannerTask {
 
             // The filtering is now done by FilterCoalesceStream inside scan_partition,
             // so we just need to get the next batch from the stream.
-            let record_batch = match self.stream.next().await {
+            let next_batch = tokio::select! {
+                biased;
+                _ = &mut watch_fut => {
+                    debug!("Removing active scanner due to peer {} being dead", self.peer);
+                    return;
+                }
+                _ = self.cancellation.changed() => {
+                    debug!("Cancelling active remote scanner {}", self.scanner_id);
+                    return;
+                }
+                next_batch = self.stream.next() => next_batch,
+            };
+
+            let record_batch = match next_batch {
                 Some(Ok(record_batch)) => record_batch,
                 Some(Err(e)) => {
                     warn!("Error while scanning {}: {e}", self.scanner_id);

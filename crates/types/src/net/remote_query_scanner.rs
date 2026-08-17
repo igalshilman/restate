@@ -54,14 +54,23 @@ pub struct RemoteQueryScannerOpen {
     #[serde(default)]
     pub predicate: Option<RemoteQueryScannerPredicate>,
     /// Scanner id allocated by the caller; the server adopts this id rather than
-    /// minting its own, which lets clients pipeline the first `Next` immediately
-    /// after `Open` without waiting for the open reply.
+    /// minting its own. This lets a client close a cancelled scanner after `Open`
+    /// reaches the wire, even if it has not received the open reply yet.
     ///
     /// **Since v1.7**
     ///
     /// todo: make required in v1.8
     #[bilrost(tag(8))]
     pub scanner_id: Option<ScannerId>,
+    /// Partition owner selected while the querying node built its physical plan.
+    /// The serving node rejects the open if it no longer owns the partition.
+    ///
+    /// Node-level scans leave this unset because they are not partition-routed.
+    ///
+    /// **Since v1.8**
+    #[bilrost(tag(9))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_partition_owner: Option<GenerationalNodeId>,
 }
 
 fn default_batch_size() -> u64 {
@@ -191,12 +200,42 @@ bilrost_wire_codec!(RemoteQueryScannerClosed);
 #[cfg(test)]
 mod test {
 
+    use bilrost::{Message, OwnedMessage};
     use serde::Deserialize;
 
     use crate::{
         GenerationalNodeId,
-        net::remote_query_scanner::{ScannerBatch, ScannerFailure, ScannerId},
+        identifiers::PartitionId,
+        net::remote_query_scanner::{
+            RemoteQueryScannerPredicate, ScannerBatch, ScannerFailure, ScannerId,
+        },
+        sharding::KeyRange,
     };
+
+    #[derive(
+        Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, bilrost::Message,
+    )]
+    struct LegacyRemoteQueryScannerOpen {
+        #[bilrost(1)]
+        partition_id: PartitionId,
+        #[bilrost(2)]
+        range: KeyRange,
+        #[bilrost(3)]
+        table: String,
+        #[bilrost(tag(4), encoding(plainbytes))]
+        projection_schema_bytes: Vec<u8>,
+        #[bilrost(tag(5))]
+        #[serde(default)]
+        limit: Option<u64>,
+        #[bilrost(tag(6))]
+        #[serde(default = "super::default_batch_size")]
+        batch_size: u64,
+        #[bilrost(tag(7))]
+        #[serde(default)]
+        predicate: Option<RemoteQueryScannerPredicate>,
+        #[bilrost(tag(8))]
+        scanner_id: Option<ScannerId>,
+    }
 
     // V1/flexbuffers scanner next result type.
     #[derive(Deserialize)]
@@ -245,5 +284,51 @@ mod test {
         assert!(
             matches!(v1, RemoteQueryScannerNextResult::Failure { scanner_id: id, message} if id == scanner_id && message == "scanner failed successfully!" )
         )
+    }
+
+    #[test]
+    fn planned_partition_owner_is_backward_compatible() {
+        let owner = GenerationalNodeId::new(10, 20);
+        let scanner_id = ScannerId(owner, 100);
+        let new_request = super::RemoteQueryScannerOpen {
+            partition_id: PartitionId::MIN,
+            range: KeyRange::FULL,
+            table: "sys_inbox".to_owned(),
+            projection_schema_bytes: vec![1, 2, 3],
+            limit: Some(10),
+            batch_size: 128,
+            predicate: Some(RemoteQueryScannerPredicate {
+                serialized_physical_expression: vec![4, 5, 6],
+            }),
+            scanner_id: Some(scanner_id),
+            expected_partition_owner: Some(owner),
+        };
+
+        let bilrost_bytes = new_request.encode_to_vec();
+        let legacy_request = LegacyRemoteQueryScannerOpen::decode(bilrost_bytes.as_slice())
+            .expect("legacy message should skip the new owner field");
+        assert_eq!(legacy_request.partition_id, new_request.partition_id);
+        assert_eq!(legacy_request.scanner_id, new_request.scanner_id);
+
+        let mut request_without_owner = new_request;
+        request_without_owner.expected_partition_owner = None;
+        let legacy_request = LegacyRemoteQueryScannerOpen {
+            partition_id: request_without_owner.partition_id,
+            range: request_without_owner.range,
+            table: request_without_owner.table.clone(),
+            projection_schema_bytes: request_without_owner.projection_schema_bytes.clone(),
+            limit: request_without_owner.limit,
+            batch_size: request_without_owner.batch_size,
+            predicate: request_without_owner.predicate.clone(),
+            scanner_id: request_without_owner.scanner_id,
+        };
+        let decoded_request =
+            super::RemoteQueryScannerOpen::decode(legacy_request.encode_to_vec().as_slice())
+                .expect("new message should decode the legacy shape");
+        assert_eq!(decoded_request.expected_partition_owner, None);
+        assert_eq!(
+            flexbuffers::to_vec(&request_without_owner).expect("new request should serialize"),
+            flexbuffers::to_vec(&legacy_request).expect("legacy request should serialize"),
+        );
     }
 }
