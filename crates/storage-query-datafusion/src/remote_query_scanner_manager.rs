@@ -29,11 +29,8 @@ use restate_types::net::remote_query_scanner::{RemoteQueryScannerOpen, ScannerId
 use restate_types::sharding::KeyRange;
 use restate_types::{GenerationalNodeId, NodeId};
 
-use crate::partial_aggregation::PartialAggregateFragment;
-use crate::remote_query_scanner_client::{
-    OpenedRemoteScanner, RemoteScannerService, remote_scan_as_datafusion_stream,
-    remote_scan_with_partial_aggregate,
-};
+use crate::partial_aggregation::PartialAggregateExecution;
+use crate::remote_query_scanner_client::{OpenedRemoteScanner, RemoteScannerService, remote_scan};
 use crate::table_providers::{Scan, ScanPartition};
 
 pub use crate::table_providers::PartitionLocation;
@@ -52,7 +49,7 @@ struct LocalPartitionScannerRegistry {
 }
 
 impl LocalPartitionScannerRegistry {
-    pub fn get(&self, table_name: &str) -> Option<Arc<dyn ScanPartition>> {
+    fn get(&self, table_name: &str) -> Option<Arc<dyn ScanPartition>> {
         let guard = self.local_store_scanners.lock();
         guard.get(table_name).cloned()
     }
@@ -111,9 +108,7 @@ impl PartitionLocator for MetadataAwarePartitionLocator {
                 bail!("node lookup for partition {} failed", partition_id)
             }
             Some(node_id) if node_id == my_node_id => Ok(PartitionLocation::Local),
-            Some(node_id) => Ok(PartitionLocation::Remote {
-                node_id: NodeId::from(node_id),
-            }),
+            Some(node_id) => Ok(PartitionLocation::Remote(NodeId::from(node_id))),
         }
     }
 }
@@ -179,7 +174,7 @@ impl RemoteScannerManager {
     /// Combining this node's generational id with a process-local monotonic counter
     /// guarantees uniqueness across the cluster: the generation distinguishes restarts,
     /// and the counter distinguishes concurrent scans within one process lifetime.
-    pub fn allocate_scanner_id(&self) -> ScannerId {
+    pub(crate) fn allocate_scanner_id(&self) -> ScannerId {
         ScannerId(
             self.metadata.my_node_id(),
             NEXT_SCANNER_SEQ.fetch_add(1, Ordering::Relaxed),
@@ -189,7 +184,7 @@ impl RemoteScannerManager {
     /// Combines the local partition scanner for the given table, with an RPC based partition scanner
     /// this is able to both scan partition hosted at the current node, and remote partitions hosted on
     /// other nodes via RPC.
-    pub fn create_distributed_scanner(
+    pub(crate) fn create_distributed_scanner(
         &self,
         table_name: impl Into<String>,
         local_scanner: impl Into<Option<Arc<dyn ScanPartition>>>,
@@ -216,11 +211,11 @@ impl RemoteScannerManager {
             .register(table_name, Arc::new(ScanToScanPartitionAdapter(scanner)));
     }
 
-    pub fn local_partition_scanner(&self, table: &str) -> Option<Arc<dyn ScanPartition>> {
+    pub(crate) fn local_partition_scanner(&self, table: &str) -> Option<Arc<dyn ScanPartition>> {
         self.local_store_scanners.get(table)
     }
 
-    pub fn get_partition_target_node(
+    fn get_partition_target_node(
         &self,
         partition_id: PartitionId,
     ) -> anyhow::Result<PartitionLocation> {
@@ -228,7 +223,7 @@ impl RemoteScannerManager {
             .get_partition_target_node(partition_id)
     }
 
-    pub fn validate_partition_location(
+    pub(crate) fn validate_partition_location(
         &self,
         partition_id: PartitionId,
         planned_location: PartitionLocation,
@@ -242,7 +237,7 @@ impl RemoteScannerManager {
         Ok(())
     }
 
-    pub fn validate_local_partition_owner(
+    pub(crate) fn validate_local_partition_owner(
         &self,
         partition_id: PartitionId,
         expected_owner: GenerationalNodeId,
@@ -257,7 +252,7 @@ impl RemoteScannerManager {
     }
 
     /// Returns a reference to the remote scanner service for use by node-fan-out tables.
-    pub fn remote_scanner_service(&self) -> Arc<dyn RemoteScannerService> {
+    pub(crate) fn remote_scanner_service(&self) -> Arc<dyn RemoteScannerService> {
         self.remote_scanner.clone()
     }
 }
@@ -265,13 +260,13 @@ impl RemoteScannerManager {
 // ----- remote partition scanner -----
 
 #[derive(Clone, Debug)]
-pub struct RemotePartitionsScanner {
+struct RemotePartitionsScanner {
     manager: RemoteScannerManager,
     table_name: String,
 }
 
 impl RemotePartitionsScanner {
-    pub fn new(manager: RemoteScannerManager, table: impl Into<String>) -> Self {
+    fn new(manager: RemoteScannerManager, table: impl Into<String>) -> Self {
         Self {
             manager,
             table_name: table.into(),
@@ -325,6 +320,7 @@ impl ScanPartition for RemotePartitionsScanner {
             batch_size,
             limit,
             elapsed_compute,
+            None,
         )
     }
 
@@ -338,63 +334,22 @@ impl ScanPartition for RemotePartitionsScanner {
         batch_size: usize,
         limit: Option<usize>,
         elapsed_compute: Time,
+        partial_aggregate: Option<PartialAggregateExecution>,
     ) -> anyhow::Result<SendableRecordBatchStream> {
         match location {
             PartitionLocation::Local => {
                 self.manager
                     .validate_partition_location(partition_id, location)?;
-                let scanner = self.manager.local_partition_scanner(&self.table_name).ok_or_else(
-                    ||anyhow!("was expecting a local partition to be present on this node. It could be that this partition is being opened right now.")
-                )?;
-                Ok(scanner.scan_partition(
-                    partition_id,
-                    range,
-                    projection,
-                    predicate,
-                    batch_size,
-                    limit,
-                    elapsed_compute,
-                )?)
-            }
-            PartitionLocation::Remote { node_id } => {
-                let scanner_id = self.manager.allocate_scanner_id();
-                let expected_owner = match node_id {
-                    NodeId::Generational(node_id) => Some(node_id),
-                    NodeId::Plain(_) => None,
-                };
-                Ok(remote_scan_as_datafusion_stream(
-                    self.manager.remote_scanner.clone(),
-                    node_id,
-                    scanner_id,
-                    partition_id,
-                    range,
-                    self.table_name.clone(),
-                    projection,
-                    predicate,
-                    batch_size,
-                    limit,
-                    expected_owner,
-                ))
-            }
-        }
-    }
-
-    fn scan_partition_at_with_partial_aggregate(
-        &self,
-        location: PartitionLocation,
-        partition_id: PartitionId,
-        range: KeyRange,
-        projection: SchemaRef,
-        predicate: Option<Arc<dyn PhysicalExpr>>,
-        batch_size: usize,
-        limit: Option<usize>,
-        elapsed_compute: Time,
-        fragment: Arc<PartialAggregateFragment>,
-        context: Arc<datafusion::execution::TaskContext>,
-    ) -> anyhow::Result<SendableRecordBatchStream> {
-        match location {
-            PartitionLocation::Local => {
-                let raw = self.scan_partition_at(
+                let scanner = self
+                    .manager
+                    .local_partition_scanner(&self.table_name)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "local scanner for table {} is not registered",
+                            self.table_name
+                        )
+                    })?;
+                scanner.scan_partition_at(
                     location,
                     partition_id,
                     range,
@@ -403,16 +358,12 @@ impl ScanPartition for RemotePartitionsScanner {
                     batch_size,
                     limit,
                     elapsed_compute,
-                )?;
-                Ok(fragment.execute_stream(raw, context)?)
+                    partial_aggregate,
+                )
             }
-            PartitionLocation::Remote { node_id } => {
+            PartitionLocation::Remote(node_id) => {
                 let scanner_id = self.manager.allocate_scanner_id();
-                let expected_owner = match node_id {
-                    NodeId::Generational(node_id) => Some(node_id),
-                    NodeId::Plain(_) => None,
-                };
-                Ok(remote_scan_with_partial_aggregate(
+                Ok(remote_scan(
                     self.manager.remote_scanner.clone(),
                     node_id,
                     scanner_id,
@@ -423,9 +374,8 @@ impl ScanPartition for RemotePartitionsScanner {
                     predicate,
                     batch_size,
                     limit,
-                    expected_owner,
-                    fragment,
-                    context,
+                    node_id.as_generational(),
+                    partial_aggregate,
                 ))
             }
         }

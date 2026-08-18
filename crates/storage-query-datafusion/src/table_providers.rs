@@ -41,16 +41,18 @@ use restate_types::sharding::KeyRange;
 
 use crate::context::SelectPartitions;
 use crate::filter::{FirstMatchingPartitionKeyExtractor, PointReadFanout};
-use crate::partial_aggregation::PartialAggregateFragment;
+use crate::partial_aggregation::{
+    PartialAggregateExecution, PartialAggregateFragment, execute_partial_aggregate,
+};
 use crate::table_util::{find_sort_columns, make_ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionLocation {
     Local,
-    Remote { node_id: NodeId },
+    Remote(NodeId),
 }
 
-pub trait ScanPartition: Send + Sync + Debug + 'static {
+pub(crate) trait ScanPartition: Send + Sync + Debug + 'static {
     /// Resolves where a partition will be scanned while the physical plan is built.
     ///
     /// Implementations that only scan local data can use the default. Distributed
@@ -74,8 +76,9 @@ pub trait ScanPartition: Send + Sync + Debug + 'static {
 
     /// Scans a partition at the location selected by [`Self::partition_location`].
     ///
-    /// The default is suitable for local-only scanners. A distributed scanner must
-    /// override this method so execution cannot silently choose a different owner.
+    /// The default is suitable for local-only scanners and applies an optional partial
+    /// aggregate locally. A distributed scanner must override this method so execution
+    /// cannot silently choose a different owner.
     #[allow(clippy::too_many_arguments)]
     fn scan_partition_at(
         &self,
@@ -87,40 +90,12 @@ pub trait ScanPartition: Send + Sync + Debug + 'static {
         batch_size: usize,
         limit: Option<usize>,
         elapsed_compute: Time,
+        partial_aggregate: Option<PartialAggregateExecution>,
     ) -> anyhow::Result<SendableRecordBatchStream> {
         if location != PartitionLocation::Local {
             anyhow::bail!("local scanner cannot execute a remote partition");
         }
-        self.scan_partition(
-            partition_id,
-            range,
-            projection,
-            predicate,
-            batch_size,
-            limit,
-            elapsed_compute,
-        )
-    }
-
-    /// Scans a partition and produces partial aggregate state. Distributed
-    /// scanners override this to negotiate execution on the selected node. The
-    /// default executes the same fragment locally over the raw scan stream.
-    #[allow(clippy::too_many_arguments)]
-    fn scan_partition_at_with_partial_aggregate(
-        &self,
-        location: PartitionLocation,
-        partition_id: PartitionId,
-        range: KeyRange,
-        projection: SchemaRef,
-        predicate: Option<Arc<dyn PhysicalExpr>>,
-        batch_size: usize,
-        limit: Option<usize>,
-        elapsed_compute: Time,
-        fragment: Arc<PartialAggregateFragment>,
-        context: Arc<TaskContext>,
-    ) -> anyhow::Result<SendableRecordBatchStream> {
-        let stream = self.scan_partition_at(
-            location,
+        let stream = self.scan_partition(
             partition_id,
             range,
             projection,
@@ -129,9 +104,7 @@ pub trait ScanPartition: Send + Sync + Debug + 'static {
             limit,
             elapsed_compute,
         )?;
-        fragment
-            .execute_stream(stream, context)
-            .map_err(anyhow::Error::from)
+        execute_partial_aggregate(partial_aggregate, stream).map_err(anyhow::Error::from)
     }
 }
 
@@ -291,7 +264,6 @@ fn allocate_logical_partitions(
 /// estimate on its own.
 #[derive(Debug, Clone)]
 pub(crate) struct LocationAwareScanExec {
-    inputs: Vec<Arc<dyn ExecutionPlan>>,
     union: Arc<dyn ExecutionPlan>,
     statistics: Arc<Statistics>,
 }
@@ -302,17 +274,15 @@ impl LocationAwareScanExec {
         statistics: Arc<Statistics>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         debug_assert!(inputs.len() > 1);
-        let union = UnionExec::try_new(inputs.clone())?;
         Ok(Arc::new(Self {
-            inputs,
-            union,
+            union: UnionExec::try_new(inputs)?,
             statistics,
         }))
     }
 
     pub(crate) fn supports_partial_aggregate(&self) -> bool {
         let mut has_remote_branch = false;
-        let supported = self.inputs.iter().all(|input| {
+        let supported = self.union.children().into_iter().all(|input| {
             if let Some(scan) = input.downcast_ref::<PartitionScanExec>() {
                 return scan.limit.is_none();
             }
@@ -330,8 +300,9 @@ impl LocationAwareScanExec {
         fragment: Arc<PartialAggregateFragment>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let inputs = self
-            .inputs
-            .iter()
+            .union
+            .children()
+            .into_iter()
             .map(|input| {
                 if let Some(local) = input.downcast_ref::<PartitionScanExec>() {
                     fragment.create_partial_exec(Arc::new(local.clone()))
@@ -370,7 +341,7 @@ impl ExecutionPlan for LocationAwareScanExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        self.inputs.iter().collect()
+        self.union.children()
     }
 
     fn with_new_children(
@@ -551,7 +522,6 @@ where
             );
 
             let scan = PartitionScanExec {
-                location,
                 logical_partitions,
                 projected_schema: projected_schema.clone(),
                 limit,
@@ -565,8 +535,8 @@ where
 
             inputs.push(match location {
                 PartitionLocation::Local => Arc::new(scan) as Arc<dyn ExecutionPlan>,
-                PartitionLocation::Remote { .. } => {
-                    Arc::new(RemoteNodeExec::new(scan)) as Arc<dyn ExecutionPlan>
+                PartitionLocation::Remote(node_id) => {
+                    Arc::new(RemoteNodeExec::new(node_id, scan)) as Arc<dyn ExecutionPlan>
                 }
             });
         }
@@ -596,7 +566,6 @@ where
 
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionScanExec {
-    location: PartitionLocation,
     logical_partitions: Vec<LogicalPartition>,
     projected_schema: SchemaRef,
     limit: Option<usize>,
@@ -650,7 +619,7 @@ impl ExecutionPlan for PartitionScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        self.execute_with_partial_aggregate(partition, context, None)
+        self.execute_at(PartitionLocation::Local, partition, context, None)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -701,13 +670,18 @@ impl ExecutionPlan for PartitionScanExec {
 }
 
 impl PartitionScanExec {
-    fn execute_with_partial_aggregate(
+    fn execute_at(
         &self,
+        location: PartitionLocation,
         partition: usize,
         context: Arc<TaskContext>,
-        fragment: Option<Arc<PartialAggregateFragment>>,
+        partial_aggregate: Option<Arc<PartialAggregateFragment>>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let output_schema = partial_aggregate
+            .as_ref()
+            .map(|fragment| fragment.output_schema())
+            .unwrap_or_else(|| self.projected_schema.clone());
 
         let physical_partitions = self
             .logical_partitions
@@ -729,14 +703,13 @@ impl PartitionScanExec {
                     .into_iter()
                     .flatten(),
                 );
-                let location = self.location;
                 let batch_size = context.session_config().batch_size();
                 let elapsed_compute = baseline_metrics.elapsed_compute().clone();
-                let fragment = fragment.clone();
-                let context = Arc::clone(&context);
+                let partial_aggregate = partial_aggregate
+                    .map(|fragment| PartialAggregateExecution::new(fragment, Arc::clone(&context)));
                 move |(partition_id, partition)| {
-                    if let Some(fragment) = &fragment {
-                        scanner.scan_partition_at_with_partial_aggregate(
+                    scanner
+                        .scan_partition_at(
                             location,
                             partition_id,
                             partition.key_range,
@@ -745,22 +718,9 @@ impl PartitionScanExec {
                             batch_size,
                             limit,
                             elapsed_compute.clone(),
-                            Arc::clone(fragment),
-                            Arc::clone(&context),
+                            partial_aggregate.clone(),
                         )
-                    } else {
-                        scanner.scan_partition_at(
-                            location,
-                            partition_id,
-                            partition.key_range,
-                            schema.clone(),
-                            predicate.clone(),
-                            batch_size,
-                            limit,
-                            elapsed_compute.clone(),
-                        )
-                    }
-                    .map_err(|e| DataFusionError::External(e.into()))
+                        .map_err(|e| DataFusionError::External(e.into()))
                 }
             })
             .try_flatten();
@@ -771,9 +731,7 @@ impl PartitionScanExec {
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            fragment
-                .map(|fragment| fragment.output_schema())
-                .unwrap_or_else(|| self.projected_schema.clone()),
+            output_schema,
             metered,
         )))
     }
@@ -787,27 +745,21 @@ impl PartitionScanExec {
 /// node without rediscovering placement.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteNodeExec {
+    target_node: NodeId,
     scan: PartitionScanExec,
     partial_aggregate: Option<Arc<PartialAggregateFragment>>,
     plan: Arc<PlanProperties>,
 }
 
 impl RemoteNodeExec {
-    fn new(scan: PartitionScanExec) -> Self {
-        debug_assert!(matches!(scan.location, PartitionLocation::Remote { .. }));
+    fn new(target_node: NodeId, scan: PartitionScanExec) -> Self {
         let plan = scan.properties().clone();
         Self {
+            target_node,
             scan,
             partial_aggregate: None,
             plan,
         }
-    }
-
-    fn target_node(&self) -> NodeId {
-        let PartitionLocation::Remote { node_id } = self.scan.location else {
-            unreachable!("RemoteNodeExec always contains a remote partition scan")
-        };
-        node_id
     }
 
     pub(crate) fn has_limit(&self) -> bool {
@@ -825,6 +777,7 @@ impl RemoteNodeExec {
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let partial = fragment.create_partial_exec(Arc::new(self.scan.clone()))?;
         Ok(Arc::new(Self {
+            target_node: self.target_node,
             scan: self.scan.clone(),
             partial_aggregate: Some(fragment),
             plan: partial.properties().clone(),
@@ -863,8 +816,12 @@ impl ExecutionPlan for RemoteNodeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        self.scan
-            .execute_with_partial_aggregate(partition, context, self.partial_aggregate.clone())
+        self.scan.execute_at(
+            PartitionLocation::Remote(self.target_node),
+            partition,
+            context,
+            self.partial_aggregate.clone(),
+        )
     }
 
     fn partition_statistics(
@@ -906,7 +863,7 @@ impl ExecutionPlan for RemoteNodeExec {
                 .downcast_ref::<PartitionScanExec>()
                 .expect("PartitionScanExec updates preserve their type")
                 .clone();
-            Arc::new(Self::new(updated_scan)) as Arc<dyn ExecutionPlan>
+            Arc::new(Self::new(self.target_node, updated_scan)) as Arc<dyn ExecutionPlan>
         });
 
         Ok(FilterPushdownPropagation {
@@ -920,14 +877,14 @@ impl DisplayAs for RemoteNodeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "RemoteNodeExec: target_node={}", self.target_node())?;
+                write!(f, "RemoteNodeExec: target_node={}", self.target_node)?;
                 if self.partial_aggregate.is_some() {
                     write!(f, ", fragment=PartialAggregate")?;
                 }
                 Ok(())
             }
             DisplayFormatType::TreeRender => {
-                writeln!(f, "target_node={}", self.target_node())?;
+                writeln!(f, "target_node={}", self.target_node)?;
                 if self.partial_aggregate.is_some() {
                     writeln!(f, "fragment=PartialAggregate")?;
                 }
@@ -943,8 +900,7 @@ impl DisplayAs for PartitionScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "PartitionScanExec: location={:?}, scanner={:?}, partitions={}, projection=[{}]",
-                    self.location,
+                    "PartitionScanExec: scanner={:?}, partitions={}, projection=[{}]",
                     self.scanner,
                     self.logical_partitions.len(),
                     ProjectedColumns(&self.projected_schema),
@@ -961,7 +917,6 @@ impl DisplayAs for PartitionScanExec {
                 Ok(())
             }
             DisplayFormatType::TreeRender => {
-                writeln!(f, "location={:?}", self.location)?;
                 writeln!(f, "scanner={:?}", self.scanner)?;
                 writeln!(f, "partitions={}", self.logical_partitions.len())?;
                 writeln!(
@@ -1281,12 +1236,8 @@ mod tests {
 
     #[test]
     fn logical_partitions_never_cross_planned_locations() {
-        let remote_one = PartitionLocation::Remote {
-            node_id: GenerationalNodeId::new(2, 1).into(),
-        };
-        let remote_two = PartitionLocation::Remote {
-            node_id: GenerationalNodeId::new(3, 1).into(),
-        };
+        let remote_one = PartitionLocation::Remote(GenerationalNodeId::new(2, 1).into());
+        let remote_two = PartitionLocation::Remote(GenerationalNodeId::new(3, 1).into());
         let groups = vec![
             LocatedPartitions {
                 location: PartitionLocation::Local,
@@ -1349,9 +1300,9 @@ mod tests {
             if partition_id == PartitionId::MIN {
                 Ok(PartitionLocation::Local)
             } else {
-                Ok(PartitionLocation::Remote {
-                    node_id: GenerationalNodeId::new(2, 1).into(),
-                })
+                Ok(PartitionLocation::Remote(
+                    GenerationalNodeId::new(2, 1).into(),
+                ))
             }
         }
 
@@ -1403,7 +1354,7 @@ mod tests {
             .find_map(|child| child.downcast_ref::<RemoteNodeExec>())
             .expect("remote placement should have an explicit boundary");
         assert_eq!(
-            remote.target_node(),
+            remote.target_node,
             NodeId::from(GenerationalNodeId::new(2, 1))
         );
         assert!(remote.children().is_empty());

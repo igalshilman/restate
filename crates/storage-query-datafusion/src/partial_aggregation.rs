@@ -41,11 +41,48 @@ pub(crate) const PARTIAL_AGGREGATE_STATE_ABI: u32 = 1;
 /// A validated, deliberately narrow aggregate fragment that consumes raw scan
 /// rows and produces DataFusion accumulator state.
 #[derive(Clone)]
-pub struct PartialAggregateFragment {
+pub(crate) struct PartialAggregateFragment {
     group_by: PhysicalGroupBy,
     aggregate: Vec<Arc<datafusion::physical_plan::udaf::AggregateFunctionExpr>>,
     input_schema: SchemaRef,
     output_schema: SchemaRef,
+}
+
+#[derive(Clone)]
+pub(crate) struct PartialAggregateExecution {
+    fragment: Arc<PartialAggregateFragment>,
+    context: Arc<TaskContext>,
+}
+
+impl PartialAggregateExecution {
+    pub(crate) fn new(fragment: Arc<PartialAggregateFragment>, context: Arc<TaskContext>) -> Self {
+        Self { fragment, context }
+    }
+
+    pub(crate) fn output_schema(&self) -> SchemaRef {
+        self.fragment.output_schema()
+    }
+
+    pub(crate) fn to_wire(&self) -> Result<RemoteQueryScannerPartialAggregate> {
+        self.fragment.to_wire()
+    }
+
+    pub(crate) fn execute(
+        self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        self.fragment.execute_stream(stream, self.context)
+    }
+}
+
+pub(crate) fn execute_partial_aggregate(
+    partial: Option<PartialAggregateExecution>,
+    stream: SendableRecordBatchStream,
+) -> Result<SendableRecordBatchStream> {
+    match partial {
+        Some(partial) => partial.execute(stream),
+        None => Ok(stream),
+    }
 }
 
 impl Debug for PartialAggregateFragment {
@@ -445,9 +482,9 @@ mod tests {
             if partition_id == PartitionId::MIN {
                 Ok(PartitionLocation::Local)
             } else {
-                Ok(PartitionLocation::Remote {
-                    node_id: GenerationalNodeId::new(2, 1).into(),
-                })
+                Ok(PartitionLocation::Remote(
+                    GenerationalNodeId::new(2, 1).into(),
+                ))
             }
         }
 
@@ -490,8 +527,9 @@ mod tests {
             batch_size: usize,
             limit: Option<usize>,
             elapsed_compute: Time,
+            partial_aggregate: Option<PartialAggregateExecution>,
         ) -> anyhow::Result<SendableRecordBatchStream> {
-            self.scan_partition(
+            let stream = self.scan_partition(
                 partition_id,
                 range,
                 projection,
@@ -499,7 +537,8 @@ mod tests {
                 batch_size,
                 limit,
                 elapsed_compute,
-            )
+            )?;
+            execute_partial_aggregate(partial_aggregate, stream).map_err(anyhow::Error::from)
         }
     }
 

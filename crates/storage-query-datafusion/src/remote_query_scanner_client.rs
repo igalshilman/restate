@@ -9,19 +9,17 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt::{Debug, Formatter};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
-use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_expr_common::physical_expr::snapshot_generation;
 use datafusion::physical_plan::PhysicalExpr;
-use futures::future::BoxFuture;
-use futures::stream::Stream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::stream::{self, StreamExt};
 use tracing::debug;
 
 use restate_core::network::{Connection, NetworkSender, Networking, Swimlane, TransportConnect};
@@ -29,13 +27,13 @@ use restate_core::{TaskCenter, TaskCenterFutureExt, TaskKind, task_center};
 use restate_types::identifiers::PartitionId;
 use restate_types::net::remote_query_scanner::{
     RemoteQueryScannerClose, RemoteQueryScannerNext, RemoteQueryScannerNextResult,
-    RemoteQueryScannerOpen, RemoteQueryScannerOpened, RemoteQueryScannerPartialAggregate,
-    RemoteQueryScannerPredicate, ScannerBatch, ScannerFailure, ScannerId,
+    RemoteQueryScannerOpen, RemoteQueryScannerOpened, RemoteQueryScannerPredicate, ScannerBatch,
+    ScannerFailure, ScannerId,
 };
 use restate_types::sharding::KeyRange;
 use restate_types::{GenerationalNodeId, NodeId};
 
-use crate::partial_aggregation::PartialAggregateFragment;
+use crate::partial_aggregation::PartialAggregateExecution;
 use crate::{decode_record_batch, encode_expr, encode_schema};
 
 #[derive(derive_more::Debug)]
@@ -50,7 +48,7 @@ impl RemoteScanner {
     /// `Open`: if the caller's future is cancelled (or the proxy returns
     /// `Err`) after `Open` reaches the wire, the existing `Drop` impl emits
     /// `Close` so the server doesn't keep an orphan scanner until TTL.
-    pub fn new(scanner_id: ScannerId, connection: Connection) -> Self {
+    fn new(scanner_id: ScannerId, connection: Connection) -> Self {
         Self {
             scanner_id,
             connection: Some(connection),
@@ -91,7 +89,7 @@ impl RemoteScanner {
     }
 
     /// The scanner will not auto close the remote scanner on drop
-    pub fn forget(mut self) {
+    fn forget(mut self) {
         self.connection.take();
     }
 }
@@ -133,18 +131,9 @@ pub trait RemoteScannerService: Send + Sync + Debug + 'static {
     ) -> Result<OpenedRemoteScanner, DataFusionError>;
 }
 
-pub struct OpenedRemoteScanner {
-    scanner: RemoteScanner,
-    partial_aggregate_applied: bool,
-}
-
-impl OpenedRemoteScanner {
-    pub fn new(scanner: RemoteScanner, partial_aggregate_applied: bool) -> Self {
-        Self {
-            scanner,
-            partial_aggregate_applied,
-        }
-    }
+pub enum OpenedRemoteScanner {
+    Raw(RemoteScanner),
+    PartialAggregate(RemoteScanner),
 }
 
 // ----- service proxy -----
@@ -163,9 +152,8 @@ pub fn create_remote_scanner_service<T: TransportConnect>(
 /// creates a DataFusion [[SendableRecordBatchStream]] that transports
 /// record batches via the RemoteScannerService API.
 ///
-/// `scanner_id` is allocated by the caller (typically via
-/// [`RemoteScannerManager::allocate_scanner_id`]) so the server can adopt the
-/// caller's id instead of minting its own.
+/// `scanner_id` is allocated by the caller so the server can adopt the caller's
+/// id instead of minting its own.
 #[allow(clippy::too_many_arguments)]
 pub fn remote_scan_as_datafusion_stream(
     service: Arc<dyn RemoteScannerService>,
@@ -180,7 +168,7 @@ pub fn remote_scan_as_datafusion_stream(
     limit: Option<usize>,
     expected_partition_owner: Option<GenerationalNodeId>,
 ) -> SendableRecordBatchStream {
-    remote_scan_as_datafusion_stream_inner(
+    remote_scan(
         service,
         target_node_id,
         scanner_id,
@@ -197,7 +185,7 @@ pub fn remote_scan_as_datafusion_stream(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn remote_scan_with_partial_aggregate(
+pub(crate) fn remote_scan(
     service: Arc<dyn RemoteScannerService>,
     target_node_id: NodeId,
     scanner_id: ScannerId,
@@ -209,44 +197,14 @@ pub(crate) fn remote_scan_with_partial_aggregate(
     batch_size: usize,
     limit: Option<usize>,
     expected_partition_owner: Option<GenerationalNodeId>,
-    fragment: Arc<PartialAggregateFragment>,
-    context: Arc<datafusion::execution::TaskContext>,
-) -> SendableRecordBatchStream {
-    remote_scan_as_datafusion_stream_inner(
-        service,
-        target_node_id,
-        scanner_id,
-        partition_id,
-        range,
-        table_name,
-        projection_schema,
-        predicate,
-        batch_size,
-        limit,
-        expected_partition_owner,
-        Some((fragment, context)),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn remote_scan_as_datafusion_stream_inner(
-    service: Arc<dyn RemoteScannerService>,
-    target_node_id: NodeId,
-    scanner_id: ScannerId,
-    partition_id: PartitionId,
-    range: KeyRange,
-    table_name: String,
-    projection_schema: SchemaRef,
-    predicate: Option<Arc<dyn PhysicalExpr>>,
-    batch_size: usize,
-    limit: Option<usize>,
-    expected_partition_owner: Option<GenerationalNodeId>,
-    partial_aggregate: Option<(
-        Arc<PartialAggregateFragment>,
-        Arc<datafusion::execution::TaskContext>,
-    )>,
+    partial_aggregate: Option<PartialAggregateExecution>,
 ) -> SendableRecordBatchStream {
     let predicate_generation = predicate.as_ref().map(snapshot_generation).unwrap_or(0);
+    let output_schema = partial_aggregate
+        .as_ref()
+        .map(PartialAggregateExecution::output_schema)
+        .unwrap_or_else(|| Arc::clone(&projection_schema));
+
     let initial_predicate = predicate
         .as_ref()
         .map(|predicate| {
@@ -257,241 +215,178 @@ fn remote_scan_as_datafusion_stream_inner(
             })
         })
         .transpose();
-
-    let wire_partial_aggregate: Result<Option<RemoteQueryScannerPartialAggregate>, _> =
-        partial_aggregate
-            .as_ref()
-            .map(|(fragment, _)| fragment.to_wire())
-            .transpose();
-    let output_schema = partial_aggregate
+    let partial_aggregate_request = partial_aggregate
         .as_ref()
-        .map(|(fragment, _)| fragment.output_schema())
-        .unwrap_or_else(|| Arc::clone(&projection_schema));
-
-    let state = match (initial_predicate, wire_partial_aggregate) {
-        (Ok(initial_predicate), Ok(partial_aggregate_request)) => {
-            let open_request = RemoteQueryScannerOpen {
+        .map(PartialAggregateExecution::to_wire)
+        .transpose();
+    let state = match (initial_predicate, partial_aggregate_request) {
+        (Ok(predicate), Ok(partial_aggregate)) => RemoteCursorState::Opening {
+            service,
+            target_node_id,
+            request: RemoteQueryScannerOpen {
                 scanner_id: Some(scanner_id),
                 partition_id,
                 range,
                 table: table_name,
                 projection_schema_bytes: encode_schema(&projection_schema),
                 limit: limit.map(|limit| u64::try_from(limit).expect("limit to fit in a u64")),
-                predicate: initial_predicate,
+                predicate,
                 batch_size: u64::try_from(batch_size).expect("batch_size to fit in a u64"),
                 expected_partition_owner,
-                partial_aggregate: partial_aggregate_request,
-            };
-            RemoteCursorState::Opening(Box::pin(async move {
-                service.open(target_node_id, open_request).await
-            }))
-        }
-        (Err(error), _) | (_, Err(error)) => RemoteCursorState::Failed(Some(error)),
+                partial_aggregate,
+            },
+        },
+        (Err(error), _) | (_, Err(error)) => RemoteCursorState::Failed(error),
     };
 
-    Box::pin(RemoteCursorStream {
-        schema: output_schema,
-        raw_schema: projection_schema,
-        predicate,
-        predicate_generation,
-        partial_aggregate,
-        state,
-    })
+    remote_cursor_stream(
+        RemoteCursor {
+            raw_schema: projection_schema,
+            predicate,
+            predicate_generation,
+            partial_aggregate,
+            state,
+        },
+        output_schema,
+    )
 }
 
 enum RemoteCursorState {
-    Opening(BoxFuture<'static, Result<OpenedRemoteScanner, DataFusionError>>),
+    Opening {
+        service: Arc<dyn RemoteScannerService>,
+        target_node_id: NodeId,
+        request: RemoteQueryScannerOpen,
+    },
     Ready(RemoteScanner),
-    Pulling(
-        BoxFuture<
-            'static,
-            (
-                RemoteScanner,
-                Result<RemoteQueryScannerNextResult, DataFusionError>,
-            ),
-        >,
-    ),
     Fallback(SendableRecordBatchStream),
-    Failed(Option<DataFusionError>),
+    Failed(DataFusionError),
     Done,
 }
 
-struct RemoteCursorStream {
-    schema: SchemaRef,
+struct RemoteCursor {
     raw_schema: SchemaRef,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     predicate_generation: u64,
-    partial_aggregate: Option<(
-        Arc<PartialAggregateFragment>,
-        Arc<datafusion::execution::TaskContext>,
-    )>,
+    partial_aggregate: Option<PartialAggregateExecution>,
     state: RemoteCursorState,
 }
 
-impl Stream for RemoteCursorStream {
-    type Item = Result<RecordBatch, DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
+impl RemoteCursor {
+    async fn next(mut self) -> Result<Option<(RecordBatch, Self)>, DataFusionError> {
         loop {
-            match &mut this.state {
-                RemoteCursorState::Opening(open) => match open.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(opened)) => {
-                        let OpenedRemoteScanner {
-                            scanner,
-                            partial_aggregate_applied,
-                        } = opened;
-                        match (this.partial_aggregate.take(), partial_aggregate_applied) {
-                            (Some((fragment, context)), false) => {
-                                let raw_cursor = Self {
-                                    schema: Arc::clone(&this.raw_schema),
-                                    raw_schema: Arc::clone(&this.raw_schema),
-                                    predicate: this.predicate.clone(),
-                                    predicate_generation: this.predicate_generation,
+            match std::mem::replace(&mut self.state, RemoteCursorState::Done) {
+                RemoteCursorState::Opening {
+                    service,
+                    target_node_id,
+                    request,
+                } => {
+                    match (
+                        self.partial_aggregate.take(),
+                        service.open(target_node_id, request).await?,
+                    ) {
+                        (Some(partial), OpenedRemoteScanner::Raw(scanner)) => {
+                            let raw_stream = remote_cursor_stream(
+                                Self {
+                                    raw_schema: Arc::clone(&self.raw_schema),
+                                    predicate: self.predicate.clone(),
+                                    predicate_generation: self.predicate_generation,
                                     partial_aggregate: None,
                                     state: RemoteCursorState::Ready(scanner),
-                                };
-                                match fragment.execute_stream(Box::pin(raw_cursor), context) {
-                                    Ok(stream) => {
-                                        this.state = RemoteCursorState::Fallback(stream);
-                                    }
-                                    Err(error) => {
-                                        this.state = RemoteCursorState::Done;
-                                        return Poll::Ready(Some(Err(error)));
-                                    }
-                                }
-                            }
-                            (Some(_), true) | (None, false) => {
-                                this.state = RemoteCursorState::Ready(scanner);
-                            }
-                            (None, true) => {
-                                this.state = RemoteCursorState::Done;
-                                return Poll::Ready(Some(Err(DataFusionError::Internal(
-                                    "remote scanner applied an unrequested partial aggregate"
-                                        .to_owned(),
-                                ))));
-                            }
+                                },
+                                Arc::clone(&self.raw_schema),
+                            );
+                            self.state = RemoteCursorState::Fallback(partial.execute(raw_stream)?);
+                        }
+                        (Some(_), OpenedRemoteScanner::PartialAggregate(scanner))
+                        | (None, OpenedRemoteScanner::Raw(scanner)) => {
+                            self.state = RemoteCursorState::Ready(scanner);
+                        }
+                        (None, OpenedRemoteScanner::PartialAggregate(_)) => {
+                            return Err(DataFusionError::Internal(
+                                "remote scanner applied an unrequested partial aggregate"
+                                    .to_owned(),
+                            ));
                         }
                     }
-                    Poll::Ready(Err(error)) => {
-                        this.state = RemoteCursorState::Done;
-                        return Poll::Ready(Some(Err(error)));
-                    }
-                },
-                RemoteCursorState::Ready(_) => {
-                    let next_predicate = match next_predicate(
-                        &mut this.predicate_generation,
-                        this.predicate.as_ref(),
-                    ) {
-                        Ok(next_predicate) => next_predicate,
-                        Err(error) => {
-                            this.state = RemoteCursorState::Done;
-                            return Poll::Ready(Some(Err(error)));
-                        }
-                    };
-                    let RemoteCursorState::Ready(mut scanner) =
-                        std::mem::replace(&mut this.state, RemoteCursorState::Done)
-                    else {
-                        unreachable!("matched ready cursor state")
-                    };
-                    this.state = RemoteCursorState::Pulling(Box::pin(async move {
-                        let result = scanner.next_batch(next_predicate).await;
-                        (scanner, result)
-                    }));
                 }
-                RemoteCursorState::Pulling(pull) => {
-                    let (scanner, result) = match pull.as_mut().poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(result) => result,
-                    };
-
-                    match result {
-                        Ok(RemoteQueryScannerNextResult::NextBatch(ScannerBatch {
+                RemoteCursorState::Ready(mut scanner) => {
+                    let next_predicate =
+                        next_predicate(&mut self.predicate_generation, self.predicate.as_ref())?;
+                    match scanner.next_batch(next_predicate).await? {
+                        RemoteQueryScannerNextResult::NextBatch(ScannerBatch {
                             record_batch,
                             ..
-                        })) => match decode_record_batch(&record_batch) {
-                            Ok(batch) => {
-                                this.state = RemoteCursorState::Ready(scanner);
-                                return Poll::Ready(Some(Ok(batch)));
-                            }
-                            Err(error) => {
-                                this.state = RemoteCursorState::Done;
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                        },
-                        Ok(RemoteQueryScannerNextResult::NoMoreRecords(_)) => {
-                            scanner.forget();
-                            this.state = RemoteCursorState::Done;
-                            return Poll::Ready(None);
+                        }) => {
+                            let batch = decode_record_batch(&record_batch)?;
+                            self.state = RemoteCursorState::Ready(scanner);
+                            return Ok(Some((batch, self)));
                         }
-                        Ok(RemoteQueryScannerNextResult::Failure(ScannerFailure {
-                            message,
-                            ..
-                        })) => {
+                        RemoteQueryScannerNextResult::NoMoreRecords(_) => {
                             scanner.forget();
-                            this.state = RemoteCursorState::Done;
-                            return Poll::Ready(Some(Err(DataFusionError::Internal(message))));
+                            return Ok(None);
                         }
-                        Ok(RemoteQueryScannerNextResult::NoSuchScanner(_)) => {
+                        RemoteQueryScannerNextResult::Failure(ScannerFailure {
+                            message, ..
+                        }) => {
                             scanner.forget();
-                            this.state = RemoteCursorState::Done;
-                            return Poll::Ready(Some(Err(DataFusionError::Internal(
+                            return Err(DataFusionError::Internal(message));
+                        }
+                        RemoteQueryScannerNextResult::NoSuchScanner(_) => {
+                            scanner.forget();
+                            return Err(DataFusionError::Internal(
                                 "No such scanner. It could have expired due to a long period of inactivity."
                                     .to_string(),
-                            ))));
+                            ));
                         }
-                        Ok(RemoteQueryScannerNextResult::Unknown) => {
-                            this.state = RemoteCursorState::Done;
-                            return Poll::Ready(Some(Err(DataFusionError::Internal(
+                        RemoteQueryScannerNextResult::Unknown => {
+                            return Err(DataFusionError::Internal(
                                 "Received unknown scanner result".to_owned(),
-                            ))));
-                        }
-                        Err(error) => {
-                            this.state = RemoteCursorState::Done;
-                            return Poll::Ready(Some(Err(error)));
+                            ));
                         }
                     }
                 }
-                RemoteCursorState::Fallback(stream) => return stream.as_mut().poll_next(cx),
-                RemoteCursorState::Failed(error) => {
-                    return Poll::Ready(error.take().map(Err));
+                RemoteCursorState::Fallback(mut stream) => match stream.next().await.transpose()? {
+                    Some(batch) => {
+                        self.state = RemoteCursorState::Fallback(stream);
+                        return Ok(Some((batch, self)));
+                    }
+                    None => return Ok(None),
+                },
+                RemoteCursorState::Failed(error) => return Err(error),
+                RemoteCursorState::Done => {
+                    return Ok(None);
                 }
-                RemoteCursorState::Done => return Poll::Ready(None),
             }
         }
     }
 }
 
-impl RecordBatchStream for RemoteCursorStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
+fn remote_cursor_stream(cursor: RemoteCursor, schema: SchemaRef) -> SendableRecordBatchStream {
+    let stream = stream::try_unfold(cursor, RemoteCursor::next);
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
 fn next_predicate(
     predicate_generation: &mut u64,
     predicate: Option<&Arc<dyn PhysicalExpr>>,
 ) -> Result<Option<RemoteQueryScannerPredicate>, DataFusionError> {
-    if *predicate_generation != 0 {
-        // generation 0 means the predicate is static (or we never had one)
-        let predicate = predicate.ok_or(DataFusionError::Internal(
-            "Missing predicate despite non-zero predicate generation".into(),
-        ))?;
-        let current_predicate_generation = snapshot_generation(predicate);
-
-        if current_predicate_generation != *predicate_generation {
-            *predicate_generation = current_predicate_generation;
-            Ok(Some(RemoteQueryScannerPredicate {
-                serialized_physical_expression: encode_expr(predicate)?,
-            }))
-        } else {
-            Ok(None)
-        }
-    } else {
-        Ok(None)
+    // Generation zero means the predicate is static (or absent).
+    if *predicate_generation == 0 {
+        return Ok(None);
     }
+
+    let predicate = predicate.ok_or(DataFusionError::Internal(
+        "Missing predicate despite non-zero predicate generation".into(),
+    ))?;
+    let current_generation = snapshot_generation(predicate);
+    if current_generation == *predicate_generation {
+        return Ok(None);
+    }
+
+    *predicate_generation = current_generation;
+    Ok(Some(RemoteQueryScannerPredicate {
+        serialized_physical_expression: encode_expr(predicate)?,
+    }))
 }
 
 // ----- everything below is the client side implementation details -----
@@ -578,9 +473,10 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
             remote_scanner.forget();
             remote_scanner = RemoteScanner::new(scanner_id, connection);
         }
-        Ok(OpenedRemoteScanner::new(
-            remote_scanner,
-            partial_aggregate_applied,
-        ))
+        Ok(if partial_aggregate_applied {
+            OpenedRemoteScanner::PartialAggregate(remote_scanner)
+        } else {
+            OpenedRemoteScanner::Raw(remote_scanner)
+        })
     }
 }

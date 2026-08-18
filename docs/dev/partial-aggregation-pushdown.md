@@ -16,7 +16,7 @@ nodes:
 
 ```text
 LocationAwareScanExec
-├── PartitionScanExec: location=Local
+├── PartitionScanExec
 ├── RemoteNodeExec: target_node=N2:7
 └── RemoteNodeExec: target_node=N3:4
 ```
@@ -74,10 +74,10 @@ aggregation.
 
 ### 4.1 Placement is part of the scan contract
 
-`PartitionLocation` has two states: `Local` and `Remote { node_id }`.
+`PartitionLocation` has two states: `Local` and `Remote(node_id)`.
 `ScanPartition::partition_location` resolves that state while the table provider builds
 the physical plan. `scan_partition_at` subsequently receives the fixed location selected
-by the plan (`crates/storage-query-datafusion/src/table_providers.rs:47-135`).
+by the plan (`crates/storage-query-datafusion/src/table_providers.rs:49-108`).
 
 The table provider performs these steps:
 
@@ -91,7 +91,7 @@ The table provider performs these steps:
 7. combine multiple groups in `LocationAwareScanExec`.
 
 The construction is implemented in
-`crates/storage-query-datafusion/src/table_providers.rs:518-579`.
+`crates/storage-query-datafusion/src/table_providers.rs:487-547`.
 
 Logical execution lanes never contain physical partitions from different locations. A
 single lane therefore never changes from local iteration to remote RPC midway through
@@ -103,13 +103,13 @@ least one lane per location rather than violating this boundary.
 | Node | Responsibility | Ordinary children |
 |---|---|---|
 | `LocationAwareScanExec` | Concatenate location-specific partitions and retain the table's one global statistics estimate. | The local and remote placement branches. |
-| `PartitionScanExec` | Scan one set of logical partitions at its already selected location; hold static and dynamic predicates separately. | None. |
+| `PartitionScanExec` | Scan one set of logical partitions locally and hold static and dynamic predicates separately. | None. |
 | `RemoteNodeExec` | Identify one target node and own the remote scan/fragment contract for that target. | None; its scan is intentionally opaque. |
 
 `LocationAwareScanExec` delegates execution and physical properties to an internal
 `UnionExec`, but reports the original table statistics rather than summing an identical
 estimate once per placement group
-(`crates/storage-query-datafusion/src/table_providers.rs:286-411`).
+(`crates/storage-query-datafusion/src/table_providers.rs:260-380`).
 
 A separate `LocalNodeExec` is unnecessary. `PartitionScanExec` is already the concrete
 local execution leaf, whereas a remote branch needs an additional semantic boundary for
@@ -119,7 +119,7 @@ wrapper would not make an otherwise illegal state unrepresentable.
 ### 4.3 Why `RemoteNodeExec` is opaque
 
 `RemoteNodeExec::children()` returns no children even though the node privately owns its
-`PartitionScanExec` (`crates/storage-query-datafusion/src/table_providers.rs:788-868`).
+`PartitionScanExec` (`crates/storage-query-datafusion/src/table_providers.rs:747-831`).
 This is intentional.
 
 If the scan were exposed as an ordinary child, a default DataFusion rule could insert a
@@ -170,7 +170,7 @@ Execution validates a planning decision but does not make a new routing decision
   it creates the scanner.
 
 The coordinator-side validation is implemented in
-`crates/storage-query-datafusion/src/remote_query_scanner_manager.rs:229-255`; the server
+`crates/storage-query-datafusion/src/remote_query_scanner_manager.rs:226-252`; the server
 invokes it before scanner construction in
 `crates/storage-query-datafusion/src/scanner_task.rs:75-92`.
 
@@ -192,23 +192,24 @@ encoding is unchanged when the field is absent
 
 ## 6. Pull execution and backpressure
 
-The client exposes a `RecordBatchStream` with this state machine:
+The client exposes a `RecordBatchStream` backed by a `try_unfold` cursor:
 
 ```text
-Opening ──success──► Ready ──downstream poll──► Pulling
-   │                   ▲                           │
-   │                   └──────── batch ───────────┘
-   └──failure──► Done          EOF/error ───────► Done
+Opening ──success──► Ready ──downstream poll / await Next──► Ready
+   │                   │
+   │                   ├── declined fragment ──► Fallback
+   │                   └── EOF/error ──────────► Done
+   └──failure──────────────────────────────────► Done
 ```
 
 The implementation is in
-`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:166-471`.
+`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:158-390`.
 
 The invariants are:
 
 1. Normal batch pulling waits for `Open` to complete before creating a `Next`.
 2. At most one `Next` RPC is outstanding for a cursor.
-3. A `Next` is created only while servicing a downstream `poll_next`.
+3. The cursor awaits `Next` inside the future created for a downstream `poll_next`.
 4. After returning a batch, the cursor returns to `Ready`; it does not prefetch the next
    batch into a channel.
 5. The cursor owns the `RemoteScanner` in every live state after `Open` reaches the wire.
@@ -225,12 +226,12 @@ a chance to change between batches.
 
 The client-side drop guard converts DataFusion stream cancellation into a remote `Close`.
 On the server, each scanner-map entry contains both the request channel and a watch-based
-cancellation signal (`crates/storage-query-datafusion/src/scanner_task.rs:39-70`).
+cancellation signal (`crates/storage-query-datafusion/src/scanner_task.rs:40-72`).
 
 When `Close` arrives, the server removes the handle and sends the cancellation signal
 before replying (`crates/storage-query-datafusion/src/remote_query_scanner_server.rs:88-97`).
 `ScannerTask` selects cancellation and peer death both while idle and while polling
-`stream.next()` (`crates/storage-query-datafusion/src/scanner_task.rs:166-244`). This is
+`stream.next()` (`crates/storage-query-datafusion/src/scanner_task.rs:166-236`). This is
 important for partial aggregation and any other pipeline-breaking fragment because the
 first output batch may require consuming the entire input.
 
@@ -247,18 +248,18 @@ The remote boundary preserves this mechanism in two places:
 
 1. `RemoteNodeExec` implements the post-optimization filter-pushdown hook and forwards
    the result to its private `PartitionScanExec`, without exposing that scan as an
-   ordinary child (`crates/storage-query-datafusion/src/table_providers.rs:885-916`).
+   ordinary child (`crates/storage-query-datafusion/src/table_providers.rs:842-873`).
 2. The cursor snapshots the predicate generation immediately before every `Next` and
    piggybacks a changed predicate on that pull
-   (`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:383-403` and
-   `:473-493`).
+   (`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:314-316` and
+   `:369-390`).
 
 Because there is no read-ahead, the parent TopK has processed the preceding batch before
 the next generation snapshot. The server applies an updated predicate before polling its
-next batch (`crates/storage-query-datafusion/src/scanner_task.rs:202-240`).
+next batch (`crates/storage-query-datafusion/src/scanner_task.rs:201-233`).
 
 The plan-shape test proves that DataFusion's TopK filter reaches the opaque remote scan at
-`crates/storage-query-datafusion/src/table_providers.rs:1414-1458`.
+`crates/storage-query-datafusion/src/table_providers.rs:1365-1409`.
 
 Partial aggregation does not replace this mechanism. A remote fragment must keep the
 dynamic predicate below the aggregate so filtering still applies to raw rows. Queries
@@ -327,12 +328,12 @@ Unsupported shapes remain unchanged and execute with the ordinary scan plan. Eli
 is an optimization decision, not a new query-validity rule. Local-only scans are also
 left unchanged because moving their existing partial aggregate provides no distributed
 execution benefit. The rule and eligibility checks are implemented at
-`crates/storage-query-datafusion/src/partial_aggregation.rs:69-132` and `:309-382`.
+`crates/storage-query-datafusion/src/partial_aggregation.rs:106-169` and `:347-419`.
 
 `PartitionScanExec` stores the provider's static predicate separately from later dynamic
 predicates. This lets the optimizer reason about exact predicate provenance without
 mistaking a best-effort dynamic filter for a removable static `FilterExec`
-(`crates/storage-query-datafusion/src/table_providers.rs:555-565` and `:675-695`). If a
+(`crates/storage-query-datafusion/src/table_providers.rs:568-577` and `:698-705`). If a
 remaining filter cannot be proven redundant or safely cloned into every branch, the rule
 must skip the rewrite.
 
@@ -453,7 +454,7 @@ The implementation and subsequent optimizer extensions must preserve these invar
 - location-specific execution lanes;
 - `LocationAwareScanExec`, local `PartitionScanExec`, and opaque `RemoteNodeExec`;
 - fixed-location execution and owner validation through wire tag 9;
-- direct pull cursor state machine;
+- direct pull `try_unfold` cursor;
 - active server cancellation;
 - separate static and dynamic scan predicates;
 - TopK pushdown forwarding through `RemoteNodeExec`;
@@ -491,7 +492,7 @@ and accepted/declined metrics.
 
 The foundation has high-signal tests for placement isolation, the explicit remote plan
 shape, global statistics, TopK filter propagation, and tag-9 compatibility at
-`crates/storage-query-datafusion/src/table_providers.rs:1282-1458` and
+`crates/storage-query-datafusion/src/table_providers.rs:1238-1409` and
 `crates/types/src/net/remote_query_scanner.rs:325-396`.
 
 The implemented partial-aggregation coverage includes a mixed-placement plan-shape and

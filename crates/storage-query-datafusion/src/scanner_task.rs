@@ -172,26 +172,25 @@ impl ScannerTask {
         let mut watch_fut = std::pin::pin!(
             peer_watch.conditional_wait_for(self.peer.generation(), |state| !state.is_alive())
         );
-
-        loop {
-            let request = tokio::select! {
+        let mut shutdown = std::pin::pin!(async {
+            tokio::select! {
                 _ = &mut watch_fut => {
-                    // peer is dead, dispose the scanner
-                    debug!("Removing scanner due to peer {} being dead", self.peer);
-                    return;
+                    debug!("Removing scanner because peer {} is dead", self.peer);
                 }
                 _ = self.cancellation.changed() => {
                     debug!("Remote scanner {} was cancelled", self.scanner_id);
-                    return;
                 }
+            }
+        });
+
+        loop {
+            let request = tokio::select! {
+                _ = &mut shutdown => return,
                 maybe_request = self.rx.recv() => {
-                    match maybe_request {
-                            Some(request) => request,
-                            None => {
-                                // scanner has been closed.
-                                return;
-                            }
-                        }
+                    let Some(request) = maybe_request else {
+                        return;
+                    };
+                    request
                 }
                 () = tokio::time::sleep(SCANNER_EXPIRATION) => {
                     warn!("Removing scanner due to a long inactivity {}", self.scanner_id);
@@ -229,14 +228,7 @@ impl ScannerTask {
             // so we just need to get the next batch from the stream.
             let next_batch = tokio::select! {
                 biased;
-                _ = &mut watch_fut => {
-                    debug!("Removing active scanner due to peer {} being dead", self.peer);
-                    return;
-                }
-                _ = self.cancellation.changed() => {
-                    debug!("Cancelling active remote scanner {}", self.scanner_id);
-                    return;
-                }
+                _ = &mut shutdown => return,
                 next_batch = self.stream.next() => next_batch,
             };
 

@@ -140,7 +140,7 @@ match location {
         // Use LocalPartitionsScanner directly
         scanner.scan_partition(...)
     }
-    PartitionLocation::Remote { node_id } => {
+    PartitionLocation::Remote(node_id) => {
         // Use remote_scan_as_datafusion_stream
         remote_scan_as_datafusion_stream(...)
     }
