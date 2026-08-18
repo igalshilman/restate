@@ -23,6 +23,8 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
@@ -629,11 +631,13 @@ impl QueryContext {
         //
         // build the state
         //
+        let mut physical_optimizer = PhysicalOptimizer::new();
+        install_partial_aggregation_pushdown(&mut physical_optimizer.rules)?;
         let state = SessionStateBuilder::new()
             .with_config(session_config)
             .with_runtime_env(runtime)
             .with_default_features()
-            .with_physical_optimizer_rule(Arc::new(PartialAggregationPushdown))
+            .with_physical_optimizer_rules(physical_optimizer.rules)
             .build();
 
         let mut ctx = SessionContext::new_with_state(state);
@@ -686,6 +690,21 @@ impl QueryContext {
     }
 }
 
+fn install_partial_aggregation_pushdown(
+    rules: &mut Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
+) -> Result<(), DataFusionError> {
+    let post_filter_pushdown = rules
+        .iter()
+        .position(|rule| rule.name() == "FilterPushdown(Post)")
+        .ok_or_else(|| {
+            DataFusionError::Internal(
+                "post-optimization filter pushdown rule is not installed".to_owned(),
+            )
+        })?;
+    rules.insert(post_filter_pushdown, Arc::new(PartialAggregationPushdown));
+    Ok(())
+}
+
 impl AsRef<SessionContext> for QueryContext {
     fn as_ref(&self) -> &SessionContext {
         &self.datafusion_context
@@ -730,5 +749,28 @@ impl SelectPartitions for SelectPartitionsFromMetadata {
                 .map(|(a, b)| (*a, b.clone()))
                 .collect()
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_aggregation_runs_before_the_final_optimizer_tail() {
+        let mut optimizer = PhysicalOptimizer::new();
+        install_partial_aggregation_pushdown(&mut optimizer.rules)
+            .expect("default optimizer has the post-filter rule");
+        let names = optimizer
+            .rules
+            .iter()
+            .map(|rule| rule.name())
+            .collect::<Vec<_>>();
+        let partial = names
+            .iter()
+            .position(|name| *name == "PartialAggregationPushdown")
+            .expect("partial aggregation rule");
+        assert_eq!(names[partial + 1], "FilterPushdown(Post)");
+        assert_eq!(names[partial + 2], "SanityCheckPlan");
     }
 }

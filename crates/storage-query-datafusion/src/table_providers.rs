@@ -1393,12 +1393,12 @@ mod tests {
         let mut config = ConfigOptions::new();
         config.optimizer.enable_topk_dynamic_filter_pushdown = true;
 
-        let optimized = FilterPushdown::new_post_optimization()
-            .optimize(sort, &config)
-            .expect("TopK filter pushdown should succeed");
         let optimized = PartialAggregationPushdown
-            .optimize(optimized, &config)
+            .optimize(sort, &config)
             .expect("partial aggregation rule should preserve the TopK plan");
+        let optimized = FilterPushdown::new_post_optimization()
+            .optimize(optimized, &config)
+            .expect("TopK filter pushdown should succeed after partial aggregation pushdown");
         let scan = optimized.children()[0]
             .downcast_ref::<LocationAwareScanExec>()
             .expect("sort input should remain a location-aware scan");

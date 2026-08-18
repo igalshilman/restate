@@ -136,11 +136,12 @@ subtree at that point.
 
 The location nodes are created by `TableProvider::scan`, which is part of physical-plan
 construction. They are therefore visible to subsequent physical optimizer passes.
-Restate builds its session with DataFusion's default features and appends
-`PartialAggregationPushdown` at
-`crates/storage-query-datafusion/src/context.rs:631-637`. The rule therefore sees both
-the DataFusion aggregate split and the explicit placement nodes, including the
-round-robin repartition inserted below the original partial aggregate.
+Restate starts with DataFusion's default physical rules and inserts
+`PartialAggregationPushdown` immediately before the post-optimization
+`FilterPushdown`. The custom rule therefore sees the DataFusion aggregate split, the
+explicit placement nodes, and the round-robin repartition below the original partial
+aggregate. DataFusion's final dynamic-filter repair and `SanityCheckPlan` still run
+after the Restate rewrite (`crates/storage-query-datafusion/src/context.rs:634-641`).
 
 The custom rule must operate on `RemoteNodeExec` through a dedicated API. It must not
 rely on generic child rewriting to cross the opaque boundary.
@@ -172,7 +173,7 @@ Execution validates a planning decision but does not make a new routing decision
 The coordinator-side validation is implemented in
 `crates/storage-query-datafusion/src/remote_query_scanner_manager.rs:226-252`; the server
 invokes it before scanner construction in
-`crates/storage-query-datafusion/src/scanner_task.rs:75-92`.
+`crates/storage-query-datafusion/src/scanner_task.rs:78-91`.
 
 Any mismatch returns an execution error. DataFusion then fails the query as a whole. No
 branch is redirected, and no result combines data read under two independently resolved
@@ -188,7 +189,16 @@ which use the scanner protocol but are not partition-routed.
 The field is additive. Compatibility coverage verifies that an old-shape bilrost message
 can be decoded by the new type, that the old type skips tag 9, and that the flexbuffers
 encoding is unchanged when the field is absent
-(`crates/types/src/net/remote_query_scanner.rs:325-376`).
+(`crates/types/src/net/remote_query_scanner.rs:339-423`).
+
+Additive decoding alone is not sufficient for ownership fencing: an older worker can
+ignore tag 9 and return the legacy `Success`. A partition-routed client therefore
+accepts only `SuccessWithOwnerValidation` or `SuccessWithPartialAggregate`, both of
+which positively acknowledge that the worker understood and validated the planned
+owner. A legacy `Success` fails an owner-fenced query and closes the opened scanner.
+New-shape failures carry the server's diagnostic so an ownership mismatch reports the
+partition and validation result rather than a generic open error
+(`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:559-595`).
 
 ## 6. Pull execution and backpressure
 
@@ -203,7 +213,7 @@ Opening ──success──► Ready ──downstream poll / await Next──►
 ```
 
 The implementation is in
-`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:158-390`.
+`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:218-458`.
 
 The invariants are:
 
@@ -231,7 +241,7 @@ cancellation signal (`crates/storage-query-datafusion/src/scanner_task.rs:40-72`
 When `Close` arrives, the server removes the handle and sends the cancellation signal
 before replying (`crates/storage-query-datafusion/src/remote_query_scanner_server.rs:88-97`).
 `ScannerTask` selects cancellation and peer death both while idle and while polling
-`stream.next()` (`crates/storage-query-datafusion/src/scanner_task.rs:166-236`). This is
+`stream.next()` (`crates/storage-query-datafusion/src/scanner_task.rs:170-229`). This is
 important for partial aggregation and any other pipeline-breaking fragment because the
 first output batch may require consuming the entire input.
 
@@ -251,18 +261,18 @@ The remote boundary preserves this mechanism in two places:
    ordinary child (`crates/storage-query-datafusion/src/table_providers.rs:842-873`).
 2. The cursor snapshots the predicate generation immediately before every `Next` and
    piggybacks a changed predicate on that pull
-   (`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:314-316` and
-   `:369-390`).
+   (`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:322-340` and
+   `:380-400`).
 
 Because there is no read-ahead, the parent TopK has processed the preceding batch before
 the next generation snapshot. The server applies an updated predicate before polling its
-next batch (`crates/storage-query-datafusion/src/scanner_task.rs:201-233`).
+next batch (`crates/storage-query-datafusion/src/scanner_task.rs:205-229`).
 
-The plan-shape test proves that DataFusion's TopK filter reaches the opaque remote scan and
-survives the later partial-aggregation rule at
+The plan-shape test runs the rules in session order and proves that DataFusion's TopK
+filter reaches the opaque remote scan after the partial-aggregation rule at
 `crates/storage-query-datafusion/src/table_providers.rs:1366-1413`. Generation-update
 coverage verifies that a changed predicate is serialized once for the next pull at
-`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:508-562`.
+`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:682-737`.
 
 Partial aggregation does not replace this mechanism. A remote fragment must keep the
 dynamic predicate below the aggregate so filtering still applies to raw rows. Queries
@@ -337,7 +347,7 @@ Unsupported shapes remain unchanged and execute with the ordinary scan plan. Eli
 is an optimization decision, not a new query-validity rule. Local-only scans are also
 left unchanged because moving their existing partial aggregate provides no distributed
 execution benefit. The rule and eligibility checks are implemented at
-`crates/storage-query-datafusion/src/partial_aggregation.rs:147-230` and `:434-531`.
+`crates/storage-query-datafusion/src/partial_aggregation.rs:148-238` and `:452-540`.
 
 `PartitionScanExec` continues to store the provider's static predicate separately from
 later dynamic predicates (`crates/storage-query-datafusion/src/table_providers.rs:568-577`
@@ -361,6 +371,7 @@ struct PartialAggregateFragment {
     scan_schema: SchemaRef,
     aggregate_input_schema: SchemaRef,
     output_schema: SchemaRef,
+    wire: OnceLock<RemoteQueryScannerPartialAggregate>,
 }
 ```
 
@@ -394,8 +405,9 @@ permission to execute an arbitrary serialized physical plan.
 `RemoteQueryScannerOpen.partial_aggregate` is optional bilrost tag 10. It carries the
 state ABI, serialized partial plan, and expected accumulator-state schema. Acceptance is
 reported with `RemoteQueryScannerOpened::SuccessWithPartialAggregate`; the original
-`Success` variant means that the scanner opened but the fragment was not applied
-(`crates/types/src/net/remote_query_scanner.rs:74-133`).
+`SuccessWithOwnerValidation` means that an owner-fenced scanner opened but the fragment
+was not applied. The original `Success` remains only for requests without owner fencing
+(`crates/types/src/net/remote_query_scanner.rs:74-148`).
 
 Execution then proceeds as follows:
 
@@ -404,18 +416,20 @@ Execution then proceeds as follows:
    before consuming input;
 3. if accepted, it returns `SuccessWithPartialAggregate` and streams accumulator-state
    batches;
-4. if unsupported before execution, it returns the original `Success` and streams raw
+4. if unsupported before execution, it acknowledges owner validation and streams raw
    batches;
 5. the client applies the same residual filter and partial aggregate locally to an
    unapplied raw stream, so the outward `RemoteNodeExec` schema remains accumulator state;
 6. an error after `applied=true` fails the query because raw input may already have been
    consumed.
 
-An old server will ignore the optional tag and return the existing success response. A
-new client interprets that response as `applied=false`. An old client never sends the
-fragment and therefore never receives the new response variant. Flexbuffers fields must
-use `serde(default, skip_serializing_if = "Option::is_none")`, and both bilrost directions
-must be covered by old-shape compatibility tests.
+An old server ignores both optional request fields and returns the existing success
+response. A new client must reject that response when owner fencing was requested; this
+can transiently fail partition-routed queries from an upgraded coordinator to an older
+worker, but cannot silently execute against an unvalidated owner. An old client never
+sends either new field and therefore receives only the legacy response variants.
+Flexbuffers fields must use `serde(default, skip_serializing_if = "Option::is_none")`,
+and both bilrost directions must be covered by old-shape compatibility tests.
 
 The client cursor does not expose raw batches through its state-schema stream while
 fallback is being selected. `Open` produces an internal negotiated cursor; the
@@ -430,6 +444,10 @@ exact filter and partial aggregate. The exact filter can duplicate scan-level pr
 which is intentional because scan predicate handling is not part of the `ScanPartition`
 correctness contract. The fragment uses the server's query `TaskContext`, so allocations
 are charged to its DataFusion memory pool.
+
+Fragment construction preflights the protobuf encoding once and caches that validated
+wire representation. Opening multiple physical partitions clones the encoded payload;
+it does not rebuild and re-encode the same DataFusion fragment for every partition.
 
 Explicit fragment admission accounting remains an operational follow-up. Today fragment
 memory is governed by the server query context's DataFusion memory pool, but there is no
@@ -483,7 +501,8 @@ The implementation and subsequent optimizer extensions must preserve these invar
 
 - add the typed in-memory `PartialAggregateFragment`;
 - add validated fragment state and output properties to `RemoteNodeExec`;
-- register the physical optimizer after DataFusion's standard physical rules;
+- insert the physical optimizer before DataFusion's final dynamic-filter and sanity
+  rules;
 - rewrite local branches and execute declined remote fragments locally;
 - add plan-shape and result-equivalence tests.
 
@@ -510,27 +529,28 @@ and accepted/declined metrics.
 ## 12. Test strategy
 
 The foundation has high-signal tests for placement isolation, the explicit remote plan
-shape, global statistics, TopK filter propagation, and tag-9 compatibility at
-`crates/storage-query-datafusion/src/table_providers.rs:1238-1413` and
-`crates/types/src/net/remote_query_scanner.rs:325-394`.
+shape, global statistics, TopK filter propagation, tag-9 compatibility, positive owner
+acknowledgement, detailed open failures, client-side dynamic-filter serialization,
+server-side dynamic-filter application, and cancellation of a blocked active pull.
+Transport-level cursor tests additionally prove that pulls do not prefetch, changed
+dynamic predicates travel on the following `Next`, and dropping a blocked pull closes
+the remote scanner.
 
 The implemented partial-aggregation coverage includes a mixed-placement plan-shape and
 result-equivalence test for every allowlisted aggregate, fragment codec round-trip
 coverage, filtered grouped aggregation, filtered `COUNT(*)` with an embedded filter
 projection, a scanner that ignores pushed predicates, rejection of unconstructable reduce
 accumulators, global aggregation coverage, TopK propagation coverage, and protocol
-compatibility tests. The implementation was also verified manually with three-node
+compatibility tests. A declined-fragment transport test proves that raw batches are
+consumed through the local fallback aggregate and never escape through the fragment's
+state-schema stream. The implementation was also verified manually with three-node
 `EXPLAIN ANALYZE`. The remaining matrix should add:
 
 - identical result tests for local-only, remote-only, and mixed placement;
 - empty-input tests, especially global aggregation's single output row;
 - supported null behavior across the aggregate allowlist;
 - explicit non-rewrite tests for every eligibility rejection;
-- server-decline fallback and post-accept failure tests;
-- a fake-transport pull test proving that no second `Next` is sent before another poll;
-- a dynamic-filter transport test proving that a changed TopK generation is serialized
-  on the following `Next`;
-- cancellation while a deliberately blocking stream is producing its first batch;
+- post-accept remote failure tests;
 - ownership movement between planning and both local and remote execution.
 
 ## 13. Operational visibility
@@ -545,7 +565,8 @@ The following node-level metrics should accompany remote fragments:
 - ownership-validation failures;
 - server-side DataFusion memory consumption or reservation failures.
 
-Expected declines during rolling upgrades or admission pressure should be debug events
-and counters, not one warning per scanner. Ownership mismatch and post-accept execution
-failure remain query errors and should carry the partition, planned target, and current
-validation result without including user row data.
+Expected fragment declines due to an unsupported ABI, allowlist, or admission pressure
+should be debug events and counters, not one warning per scanner. Missing ownership
+acknowledgement, ownership mismatch, and post-accept execution failure remain query errors
+and should carry the partition, planned target, and current validation result without
+including user row data.

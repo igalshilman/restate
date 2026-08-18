@@ -9,7 +9,7 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -51,6 +51,7 @@ pub(crate) struct PartialAggregateFragment {
     scan_schema: SchemaRef,
     aggregate_input_schema: SchemaRef,
     output_schema: SchemaRef,
+    wire: OnceLock<RemoteQueryScannerPartialAggregate>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +103,7 @@ impl PartialAggregateExecution {
         self.fragment.output_schema()
     }
 
-    pub(crate) fn to_wire(&self) -> Result<RemoteQueryScannerPartialAggregate> {
+    pub(crate) fn to_wire(&self) -> RemoteQueryScannerPartialAggregate {
         self.fragment.to_wire()
     }
 
@@ -165,8 +166,13 @@ impl PartialAggregateFragment {
         let fragment = Self::from_supported_aggregate(aggregate, filter, scan_schema)?;
 
         // Prove at planning time that the filter, grouping, and aggregate
-        // expressions are representable by the physical protobuf codec.
-        fragment.to_wire().ok()?;
+        // expressions are representable by the physical protobuf codec, and
+        // retain that encoding for every partition opened from this fragment.
+        let wire = fragment.encode_wire().ok()?;
+        fragment
+            .wire
+            .set(wire)
+            .expect("new partial aggregate fragment has no cached wire encoding");
         Some(fragment)
     }
 
@@ -227,6 +233,7 @@ impl PartialAggregateFragment {
             scan_schema,
             aggregate_input_schema: aggregate.input_schema(),
             output_schema: aggregate.schema(),
+            wire: OnceLock::new(),
         })
     }
 
@@ -339,7 +346,14 @@ impl PartialAggregateFragment {
         self.create_partial_exec(input)?.execute(0, context)
     }
 
-    pub(crate) fn to_wire(&self) -> Result<RemoteQueryScannerPartialAggregate> {
+    pub(crate) fn to_wire(&self) -> RemoteQueryScannerPartialAggregate {
+        self.wire
+            .get()
+            .expect("validated partial aggregate has a cached wire encoding")
+            .clone()
+    }
+
+    fn encode_wire(&self) -> Result<RemoteQueryScannerPartialAggregate> {
         let placeholder =
             Arc::new(EmptyExec::new(Arc::clone(&self.scan_schema))) as Arc<dyn ExecutionPlan>;
         let aggregate = self.create_partial_exec(placeholder)?;
@@ -401,6 +415,10 @@ impl PartialAggregateFragment {
         {
             return Ok(None);
         }
+        fragment
+            .wire
+            .set(wire.clone())
+            .expect("new partial aggregate fragment has no cached wire encoding");
         Ok(Some(fragment))
     }
 }
@@ -789,12 +807,14 @@ mod tests {
 
         let fragment = PartialAggregateFragment::from_aggregate(&partial, Some(residual_filter))
             .expect("supported fragment");
-        let wire = fragment.to_wire().expect("fragment serialization");
+        let wire = fragment.to_wire();
+        assert_eq!(fragment.to_wire(), wire);
         let decoded = PartialAggregateFragment::from_wire(&wire, &context.task_ctx(), &schema)
             .expect("fragment deserialization")
             .expect("compatible fragment");
         assert_eq!(decoded.output_schema(), fragment.output_schema());
         assert!(decoded.filter.is_some());
+        assert_eq!(decoded.to_wire(), wire);
 
         let partial = Arc::new(partial) as Arc<dyn ExecutionPlan>;
         let optimized = PartialAggregationPushdown
@@ -931,7 +951,7 @@ mod tests {
         let (scan, filter) = extract_fragment_input(&partial).expect("count fragment input");
         let fragment = PartialAggregateFragment::from_aggregate(&partial, filter.as_ref())
             .expect("filtered count fragment");
-        let wire = fragment.to_wire().expect("filtered count serialization");
+        let wire = fragment.to_wire();
         let decoded =
             PartialAggregateFragment::from_wire(&wire, &context.task_ctx(), &scan.schema())
                 .expect("filtered count deserialization")

@@ -124,12 +124,26 @@ pub enum RemoteQueryScannerOpened {
         scanner_id: ScannerId,
     },
     /// The scanner was opened and accepted the requested partial aggregate.
-    /// This is a distinct response variant so the existing `Success` wire shape
-    /// remains compatible with old clients and servers.
+    /// When the request included `expected_partition_owner`, this also
+    /// acknowledges that the server validated it.
     #[bilrost(tag(2), message)]
     SuccessWithPartialAggregate {
         #[bilrost(1)]
         scanner_id: ScannerId,
+    },
+    /// The scanner was opened without a partial aggregate and the server
+    /// validated the requested partition owner.
+    #[bilrost(tag(3), message)]
+    SuccessWithOwnerValidation {
+        #[bilrost(1)]
+        scanner_id: ScannerId,
+    },
+    /// The scanner could not be opened. New clients use the message to surface
+    /// ownership fencing and fragment-validation failures to the query caller.
+    #[bilrost(tag(4), message)]
+    FailureWithMessage {
+        #[bilrost(1)]
+        message: String,
     },
 }
 
@@ -390,5 +404,21 @@ mod test {
         let decoded = LegacyRemoteQueryScannerOpened::decode(unchanged.encode_to_vec().as_slice())
             .expect("old client should decode the unchanged success response");
         assert_eq!(decoded, legacy);
+
+        let owner_validated =
+            super::RemoteQueryScannerOpened::SuccessWithOwnerValidation { scanner_id };
+        assert_eq!(
+            super::RemoteQueryScannerOpened::decode(owner_validated.encode_to_vec().as_slice())
+                .expect("new owner acknowledgement should round trip"),
+            owner_validated
+        );
+        let failure = super::RemoteQueryScannerOpened::FailureWithMessage {
+            message: "owner changed".to_owned(),
+        };
+        assert_eq!(
+            super::RemoteQueryScannerOpened::decode(failure.encode_to_vec().as_slice())
+                .expect("detailed failure should round trip"),
+            failure
+        );
     }
 }

@@ -40,6 +40,26 @@ use crate::{decode_record_batch, encode_expr, encode_schema};
 pub struct RemoteScanner {
     scanner_id: ScannerId,
     connection: Option<Connection>,
+    #[cfg(test)]
+    test_scanner: Option<TestRemoteScanner>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestRemoteScanner {
+    requests: tokio::sync::mpsc::UnboundedSender<Option<RemoteQueryScannerPredicate>>,
+    responses: tokio::sync::mpsc::UnboundedReceiver<RemoteQueryScannerNextResult>,
+    closed: tokio::sync::watch::Sender<bool>,
+    close_on_drop: bool,
+}
+
+#[cfg(test)]
+impl Drop for TestRemoteScanner {
+    fn drop(&mut self) {
+        if self.close_on_drop {
+            let _ = self.closed.send(true);
+        }
+    }
 }
 
 impl RemoteScanner {
@@ -52,6 +72,27 @@ impl RemoteScanner {
         Self {
             scanner_id,
             connection: Some(connection),
+            #[cfg(test)]
+            test_scanner: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        scanner_id: ScannerId,
+        requests: tokio::sync::mpsc::UnboundedSender<Option<RemoteQueryScannerPredicate>>,
+        responses: tokio::sync::mpsc::UnboundedReceiver<RemoteQueryScannerNextResult>,
+        closed: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            scanner_id,
+            connection: None,
+            test_scanner: Some(TestRemoteScanner {
+                requests,
+                responses,
+                closed,
+                close_on_drop: true,
+            }),
         }
     }
 
@@ -59,6 +100,16 @@ impl RemoteScanner {
         &mut self,
         next_predicate: Option<RemoteQueryScannerPredicate>,
     ) -> Result<RemoteQueryScannerNextResult, DataFusionError> {
+        #[cfg(test)]
+        if let Some(scanner) = self.test_scanner.as_mut() {
+            scanner.requests.send(next_predicate).map_err(|_| {
+                DataFusionError::Internal("test scanner request receiver dropped".to_owned())
+            })?;
+            return scanner.responses.recv().await.ok_or_else(|| {
+                DataFusionError::Internal("test scanner response sender dropped".to_owned())
+            });
+        }
+
         let Some(ref connection) = self.connection else {
             return Err(DataFusionError::Internal(
                 "connection used after forget()".to_string(),
@@ -91,11 +142,20 @@ impl RemoteScanner {
     /// The scanner will not auto close the remote scanner on drop
     fn forget(mut self) {
         self.connection.take();
+        #[cfg(test)]
+        if let Some(scanner) = self.test_scanner.as_mut() {
+            scanner.close_on_drop = false;
+        }
     }
 }
 
 impl Drop for RemoteScanner {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.test_scanner.is_some() {
+            return;
+        }
+
         let scanner_id = self.scanner_id;
         if let Some(connection) = self.connection.take() {
             tokio::spawn(async move {
@@ -134,6 +194,15 @@ pub trait RemoteScannerService: Send + Sync + Debug + 'static {
 pub enum OpenedRemoteScanner {
     Raw(RemoteScanner),
     PartialAggregate(RemoteScanner),
+}
+
+#[derive(Debug)]
+enum OpenResponse {
+    Opened {
+        scanner_id: ScannerId,
+        partial_aggregate_applied: bool,
+    },
+    Rejected(String),
 }
 
 // ----- service proxy -----
@@ -217,10 +286,9 @@ pub(crate) fn remote_scan(
         .transpose();
     let partial_aggregate_request = partial_aggregate
         .as_ref()
-        .map(PartialAggregateExecution::to_wire)
-        .transpose();
-    let state = match (initial_predicate, partial_aggregate_request) {
-        (Ok(predicate), Ok(partial_aggregate)) => RemoteCursorState::Opening {
+        .map(PartialAggregateExecution::to_wire);
+    let state = match initial_predicate {
+        Ok(predicate) => RemoteCursorState::Opening {
             service,
             target_node_id,
             request: RemoteQueryScannerOpen {
@@ -233,10 +301,10 @@ pub(crate) fn remote_scan(
                 predicate,
                 batch_size: u64::try_from(batch_size).expect("batch_size to fit in a u64"),
                 expected_partition_owner,
-                partial_aggregate,
+                partial_aggregate: partial_aggregate_request,
             },
         },
-        (Err(error), _) | (_, Err(error)) => RemoteCursorState::Failed(error),
+        Err(error) => RemoteCursorState::Failed(error),
     };
 
     remote_cursor_stream(
@@ -419,6 +487,8 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
         peer: NodeId,
         req: RemoteQueryScannerOpen,
     ) -> Result<OpenedRemoteScanner, DataFusionError> {
+        let partition_id = req.partition_id;
+        let expected_partition_owner = req.expected_partition_owner;
         let connection = self
             .networking
             .get_connection(peer, Swimlane::Datafusion)
@@ -454,18 +524,23 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
         // that another caller holds under the same id.
         let mut remote_scanner = RemoteScanner::new(scanner_id, connection.clone());
 
-        let (scanner_id, partial_aggregate_applied) = match open_reply.await {
-            Ok(RemoteQueryScannerOpened::Success { scanner_id }) => (scanner_id, false),
-            Ok(RemoteQueryScannerOpened::SuccessWithPartialAggregate { scanner_id }) => {
-                (scanner_id, true)
-            }
-            Ok(RemoteQueryScannerOpened::Failure) => {
+        let response = open_reply
+            .await
+            .map_err(|e| DataFusionError::External(e.into()))?;
+        let (scanner_id, partial_aggregate_applied) = match interpret_open_response(
+            response,
+            peer,
+            partition_id,
+            expected_partition_owner,
+        )? {
+            OpenResponse::Opened {
+                scanner_id,
+                partial_aggregate_applied,
+            } => (scanner_id, partial_aggregate_applied),
+            OpenResponse::Rejected(message) => {
                 remote_scanner.forget();
-                return Err(DataFusionError::Internal(
-                    "Unable to open a remote scanner".to_string(),
-                ));
+                return Err(DataFusionError::Internal(message));
             }
-            Err(e) => return Err(DataFusionError::External(e.into())),
         };
 
         // A pre-v1.7 server can return a different scanner id.
@@ -481,20 +556,119 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
     }
 }
 
+fn interpret_open_response(
+    response: RemoteQueryScannerOpened,
+    peer: NodeId,
+    partition_id: PartitionId,
+    expected_partition_owner: Option<GenerationalNodeId>,
+) -> Result<OpenResponse, DataFusionError> {
+    match response {
+        RemoteQueryScannerOpened::Success { scanner_id } => {
+            if let Some(expected_owner) = expected_partition_owner {
+                return Err(DataFusionError::Internal(format!(
+                    "remote node {peer} opened partition {partition_id} without acknowledging validation of planned owner {expected_owner}"
+                )));
+            }
+            Ok(OpenResponse::Opened {
+                scanner_id,
+                partial_aggregate_applied: false,
+            })
+        }
+        RemoteQueryScannerOpened::SuccessWithPartialAggregate { scanner_id } => {
+            Ok(OpenResponse::Opened {
+                scanner_id,
+                partial_aggregate_applied: true,
+            })
+        }
+        RemoteQueryScannerOpened::SuccessWithOwnerValidation { scanner_id } => {
+            Ok(OpenResponse::Opened {
+                scanner_id,
+                partial_aggregate_applied: false,
+            })
+        }
+        RemoteQueryScannerOpened::Failure => Ok(OpenResponse::Rejected(
+            "unable to open a remote scanner".to_owned(),
+        )),
+        RemoteQueryScannerOpened::FailureWithMessage { message } => {
+            Ok(OpenResponse::Rejected(message))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
     use datafusion::arrow::array::{BooleanArray, Int64Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::execution::TaskContext;
+    use datafusion::functions_aggregate::count::count_udaf;
     use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_expr::expressions::{
         BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal,
     };
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::scalar::ScalarValue;
 
     use super::*;
     use crate::decode_expr;
+    use crate::partial_aggregation::PartialAggregateFragment;
+
+    #[derive(Debug)]
+    struct TestScannerService {
+        scanner: Mutex<Option<RemoteScanner>>,
+        open_requests: tokio::sync::mpsc::UnboundedSender<RemoteQueryScannerOpen>,
+    }
+
+    #[async_trait]
+    impl RemoteScannerService for TestScannerService {
+        async fn open(
+            &self,
+            _peer: NodeId,
+            request: RemoteQueryScannerOpen,
+        ) -> Result<OpenedRemoteScanner, DataFusionError> {
+            self.open_requests.send(request).map_err(|_| {
+                DataFusionError::Internal("test scanner open receiver dropped".to_owned())
+            })?;
+            let scanner = self
+                .scanner
+                .lock()
+                .expect("test scanner lock")
+                .take()
+                .ok_or_else(|| DataFusionError::Internal("test scanner reopened".to_owned()))?;
+            Ok(OpenedRemoteScanner::Raw(scanner))
+        }
+    }
+
+    struct TestScannerChannels {
+        service: Arc<dyn RemoteScannerService>,
+        open_requests: tokio::sync::mpsc::UnboundedReceiver<RemoteQueryScannerOpen>,
+        next_requests: tokio::sync::mpsc::UnboundedReceiver<Option<RemoteQueryScannerPredicate>>,
+        responses: tokio::sync::mpsc::UnboundedSender<RemoteQueryScannerNextResult>,
+        closed: tokio::sync::watch::Receiver<bool>,
+    }
+
+    fn test_scanner_channels(scanner_id: ScannerId) -> TestScannerChannels {
+        let (open_requests, open_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (next_requests, next_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (responses, response_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (closed, close_rx) = tokio::sync::watch::channel(false);
+        let scanner = RemoteScanner::for_test(scanner_id, next_requests, response_rx, closed);
+        TestScannerChannels {
+            service: Arc::new(TestScannerService {
+                scanner: Mutex::new(Some(scanner)),
+                open_requests,
+            }),
+            open_requests: open_request_rx,
+            next_requests: next_request_rx,
+            responses,
+            closed: close_rx,
+        }
+    }
 
     fn greater_than(column: &Arc<dyn PhysicalExpr>, value: i64) -> Arc<dyn PhysicalExpr> {
         Arc::new(BinaryExpr::new(
@@ -559,5 +733,311 @@ mod tests {
                 .expect("already sent predicate")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn planned_owner_requires_an_explicit_server_acknowledgement() {
+        let owner = GenerationalNodeId::new(2, 3);
+        let scanner_id = ScannerId(owner, 4);
+        let peer = NodeId::from(owner);
+
+        let error = interpret_open_response(
+            RemoteQueryScannerOpened::Success { scanner_id },
+            peer,
+            PartitionId::MIN,
+            Some(owner),
+        )
+        .expect_err("legacy success must not bypass ownership fencing");
+        assert!(
+            error
+                .to_string()
+                .contains("without acknowledging validation")
+        );
+
+        let acknowledged = interpret_open_response(
+            RemoteQueryScannerOpened::SuccessWithOwnerValidation { scanner_id },
+            peer,
+            PartitionId::MIN,
+            Some(owner),
+        )
+        .expect("new server acknowledged ownership validation");
+        assert!(matches!(
+            acknowledged,
+            OpenResponse::Opened {
+                scanner_id: id,
+                partial_aggregate_applied: false,
+            } if id == scanner_id
+        ));
+
+        let rejected = interpret_open_response(
+            RemoteQueryScannerOpened::FailureWithMessage {
+                message: "planned owner N2:3, current owner N2:4".to_owned(),
+            },
+            peer,
+            PartitionId::MIN,
+            Some(owner),
+        )
+        .expect("server rejection is a valid response");
+        assert!(matches!(
+            rejected,
+            OpenResponse::Rejected(message) if message.contains("current owner")
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_cursor_is_pull_driven_and_forwards_dynamic_predicates() {
+        let owner = GenerationalNodeId::new(2, 3);
+        let scanner_id = ScannerId(owner, 4);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let column = Arc::new(Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            greater_than(&column, 10),
+        ));
+        let predicate = Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>;
+        let mut channels = test_scanner_channels(scanner_id);
+        let stream = remote_scan_as_datafusion_stream(
+            Arc::clone(&channels.service),
+            NodeId::from(owner),
+            scanner_id,
+            PartitionId::MIN,
+            KeyRange::FULL,
+            "sys_test".to_owned(),
+            Arc::clone(&schema),
+            Some(predicate),
+            128,
+            None,
+            Some(owner),
+        );
+        assert!(matches!(
+            channels.open_requests.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let first_poll = tokio::spawn(async move {
+            let mut stream = stream;
+            let batch = stream.next().await;
+            (batch, stream)
+        });
+        let open = channels
+            .open_requests
+            .recv()
+            .await
+            .expect("first poll opens the scanner");
+        assert!(open.predicate.is_some());
+        assert!(
+            channels
+                .next_requests
+                .recv()
+                .await
+                .expect("first batch request")
+                .is_none(),
+            "the initial predicate travels on Open"
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![11, 12]))],
+        )
+        .expect("remote batch");
+        channels
+            .responses
+            .send(RemoteQueryScannerNextResult::NextBatch(ScannerBatch {
+                scanner_id,
+                record_batch: crate::encode_record_batch(&schema, batch)
+                    .expect("encode remote batch"),
+            }))
+            .expect("first batch receiver");
+        let (batch, stream) = first_poll.await.expect("first poll task");
+        assert_eq!(
+            batch
+                .expect("first batch result")
+                .expect("successful first batch")
+                .num_rows(),
+            2
+        );
+        assert!(matches!(
+            channels.next_requests.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        dynamic
+            .update(greater_than(&column, 20))
+            .expect("update TopK predicate");
+        let second_poll = tokio::spawn(async move {
+            let mut stream = stream;
+            let batch = stream.next().await;
+            (batch, stream)
+        });
+        assert!(
+            channels
+                .next_requests
+                .recv()
+                .await
+                .expect("second batch request")
+                .is_some(),
+            "the changed predicate travels on the following pull"
+        );
+        channels
+            .responses
+            .send(RemoteQueryScannerNextResult::NoMoreRecords(scanner_id))
+            .expect("end-of-stream receiver");
+        let (batch, stream) = second_poll.await.expect("second poll task");
+        assert!(batch.is_none());
+        drop(stream);
+        assert!(!*channels.closed.borrow());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_blocked_pull_closes_the_remote_scanner() {
+        let owner = GenerationalNodeId::new(2, 3);
+        let scanner_id = ScannerId(owner, 4);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut channels = test_scanner_channels(scanner_id);
+        let stream = remote_scan_as_datafusion_stream(
+            Arc::clone(&channels.service),
+            NodeId::from(owner),
+            scanner_id,
+            PartitionId::MIN,
+            KeyRange::FULL,
+            "sys_test".to_owned(),
+            schema,
+            None,
+            128,
+            None,
+            Some(owner),
+        );
+
+        let blocked_pull = tokio::spawn(async move {
+            let mut stream = stream;
+            stream.next().await
+        });
+        channels
+            .open_requests
+            .recv()
+            .await
+            .expect("first poll opens the scanner");
+        channels
+            .next_requests
+            .recv()
+            .await
+            .expect("scanner is blocked on its first batch");
+        blocked_pull.abort();
+        let _ = blocked_pull.await;
+
+        tokio::time::timeout(Duration::from_secs(1), channels.closed.changed())
+            .await
+            .expect("close notification timeout")
+            .expect("close sender remains live");
+        assert!(*channels.closed.borrow());
+    }
+
+    #[tokio::test]
+    async fn declined_partial_aggregate_falls_back_before_exposing_batches() {
+        let owner = GenerationalNodeId::new(2, 3);
+        let scanner_id = ScannerId(owner, 4);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let count = Arc::new(
+            AggregateExprBuilder::new(
+                count_udaf(),
+                vec![Arc::new(Literal::new(ScalarValue::Int64(Some(1))))],
+            )
+            .schema(Arc::clone(&schema))
+            .alias("count(*)")
+            .build()
+            .expect("count expression"),
+        );
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::default(),
+            vec![count],
+            vec![None],
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::clone(&schema),
+        )
+        .expect("partial count");
+        let fragment = Arc::new(
+            PartialAggregateFragment::from_aggregate(&aggregate, None)
+                .expect("supported partial count"),
+        );
+        let partial = PartialAggregateExecution::new(fragment, Arc::new(TaskContext::default()));
+        let mut channels = test_scanner_channels(scanner_id);
+        let stream = remote_scan(
+            Arc::clone(&channels.service),
+            NodeId::from(owner),
+            scanner_id,
+            PartitionId::MIN,
+            KeyRange::FULL,
+            "sys_test".to_owned(),
+            Arc::clone(&schema),
+            None,
+            128,
+            None,
+            Some(owner),
+            Some(partial),
+        );
+
+        let poll = tokio::spawn(async move {
+            let mut stream = stream;
+            let batch = stream.next().await;
+            (batch, stream)
+        });
+        let open = channels
+            .open_requests
+            .recv()
+            .await
+            .expect("first poll opens the scanner");
+        assert!(open.partial_aggregate.is_some());
+        channels
+            .next_requests
+            .recv()
+            .await
+            .expect("fallback requests raw input");
+        let raw_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+        )
+        .expect("raw remote batch");
+        channels
+            .responses
+            .send(RemoteQueryScannerNextResult::NextBatch(ScannerBatch {
+                scanner_id,
+                record_batch: crate::encode_record_batch(&schema, raw_batch)
+                    .expect("encode raw batch"),
+            }))
+            .expect("raw batch receiver");
+        channels
+            .next_requests
+            .recv()
+            .await
+            .expect("partial aggregate consumes raw input to completion");
+        channels
+            .responses
+            .send(RemoteQueryScannerNextResult::NoMoreRecords(scanner_id))
+            .expect("end-of-stream receiver");
+
+        let (batch, stream) = poll.await.expect("fallback poll task");
+        let batch = batch
+            .expect("partial aggregate output")
+            .expect("successful local fallback");
+        let count = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count state");
+        assert_eq!(count.value(0), 2);
+        drop(stream);
+        assert!(!*channels.closed.borrow());
     }
 }

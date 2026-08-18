@@ -22,10 +22,13 @@ reduce network traffic and coordinator work for low-cardinality grouped aggregat
 ### Impact on Users
 
 Queries keep the same results and require no configuration changes. Unsupported
-aggregate shapes continue to execute on the coordinator. During rolling upgrades, a new
-querying node falls back to applying the partial aggregate locally when an older worker
-does not accept the fragment. A query that races with partition movement can return a
-transient error and should be retried.
+aggregate shapes continue to execute on the coordinator. A new querying node requires
+the worker to acknowledge validation of its planned partition owner; during a rolling
+upgrade, a partition-routed query to an older worker can therefore fail transiently
+instead of running without ownership fencing. A new worker can decline a supported
+partial aggregate before execution, in which case the querying node applies it locally.
+A query that races with partition movement can likewise return a transient error and
+should be retried.
 
 ### Migration Guidance
 

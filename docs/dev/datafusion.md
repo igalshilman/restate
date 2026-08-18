@@ -312,10 +312,12 @@ when DataFusion can construct the required accumulator for the concrete types, a
 without aggregate filters, ordering, `DISTINCT`, grouping sets, or aggregate TopK. Other
 shapes retain the coordinator-only plan. Ordinary SQL `WHERE` predicates are supported:
 DataFusion's residual `FilterExec`, including an embedded projection, is carried in the
-fragment and runs before partial aggregation. The wire field is optional; when an older
-worker does not accept the fragment, the client applies the same filter and partial
-aggregate to its raw stream before exposing it upstream. The full contract is documented
-in [Partial Aggregation Pushdown](partial-aggregation-pushdown.md).
+fragment and runs before partial aggregation. A worker that understands the ownership
+fence can decline the fragment before execution, in which case the client applies the
+same filter and partial aggregate to its raw stream before exposing it upstream. An older
+worker that cannot acknowledge the planned owner is rejected instead of running an
+unfenced scan. The full contract is documented in
+[Partial Aggregation Pushdown](partial-aggregation-pushdown.md).
 
 ### Remote Scanner Bottleneck
 

@@ -8,11 +8,15 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::Context;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::Result as DataFusionResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_plan::PhysicalExpr;
@@ -198,23 +202,15 @@ impl ScannerTask {
                 }
             };
 
-            if let Some(next_predicate) = request.next_predicate {
-                match decode_expr(
+            if let Some(next_predicate) = request.next_predicate
+                && let Err(e) = apply_next_predicate(
+                    self.dynamic_filter.as_ref(),
                     &self.ctx,
                     &self.schema,
-                    &next_predicate.serialized_physical_expression,
-                ) {
-                    Ok(next_predicate) => {
-                        if let Some(dynamic_filter) = &self.dynamic_filter
-                            && let Err(e) = dynamic_filter.update(next_predicate)
-                        {
-                            warn!("Failed to update dynamic filter: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to decode next predicate: {e}")
-                    }
-                }
+                    &next_predicate,
+                )
+            {
+                warn!("Failed to apply next predicate: {e}");
             }
 
             // connection/request has been closed, don't bother with driving the stream.
@@ -226,10 +222,10 @@ impl ScannerTask {
 
             // The filtering is now done by FilterCoalesceStream inside scan_partition,
             // so we just need to get the next batch from the stream.
-            let next_batch = tokio::select! {
-                biased;
-                _ = &mut shutdown => return,
-                next_batch = self.stream.next() => next_batch,
+            let next_batch = match next_batch_or_shutdown(&mut self.stream, shutdown.as_mut()).await
+            {
+                NextBatchPoll::Shutdown => return,
+                NextBatchPoll::Stream(next_batch) => next_batch,
             };
 
             let record_batch = match next_batch {
@@ -276,10 +272,130 @@ impl ScannerTask {
     }
 }
 
+fn apply_next_predicate(
+    dynamic_filter: Option<&Arc<DynamicFilterPhysicalExpr>>,
+    ctx: &TaskContext,
+    schema: &SchemaRef,
+    predicate: &RemoteQueryScannerPredicate,
+) -> DataFusionResult<()> {
+    let predicate = decode_expr(ctx, schema, &predicate.serialized_physical_expression)?;
+    if let Some(dynamic_filter) = dynamic_filter {
+        dynamic_filter.update(predicate)?;
+    }
+    Ok(())
+}
+
+enum NextBatchPoll {
+    Shutdown,
+    Stream(Option<DataFusionResult<RecordBatch>>),
+}
+
+async fn next_batch_or_shutdown<F>(
+    stream: &mut SendableRecordBatchStream,
+    shutdown: Pin<&mut F>,
+) -> NextBatchPoll
+where
+    F: Future<Output = ()> + ?Sized,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown => NextBatchPoll::Shutdown,
+        next_batch = stream.next() => NextBatchPoll::Stream(next_batch),
+    }
+}
+
 impl Drop for ScannerTask {
     fn drop(&mut self) {
         if let Some(scanners) = self.scanners.upgrade() {
             let _ = scanners.remove(&self.scanner_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::{BooleanArray, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::scalar::ScalarValue;
+    use futures::stream;
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::encode_expr;
+
+    fn greater_than(column: &Arc<dyn PhysicalExpr>, value: i64) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::clone(column),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(value)))),
+        ))
+    }
+
+    #[test]
+    fn next_predicate_updates_the_server_dynamic_filter() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let column = Arc::new(Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            greater_than(&column, 10),
+        ));
+        let update = RemoteQueryScannerPredicate {
+            serialized_physical_expression: encode_expr(&greater_than(&column, 20))
+                .expect("encode predicate update"),
+        };
+
+        apply_next_predicate(
+            Some(&dynamic_filter),
+            &TaskContext::default(),
+            &schema,
+            &update,
+        )
+        .expect("apply predicate update");
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![19, 20, 21]))])
+                .expect("predicate input");
+        let values = dynamic_filter
+            .evaluate(&batch)
+            .expect("updated predicate evaluation")
+            .into_array(batch.num_rows())
+            .expect("updated predicate values");
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean predicate values"),
+            &BooleanArray::from(vec![false, false, true])
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_active_batch_pull() {
+        let schema = Arc::new(Schema::empty());
+        let pending = stream::pending::<DataFusionResult<RecordBatch>>();
+        let mut stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, pending));
+        let (cancel, cancelled) = oneshot::channel::<()>();
+
+        let task = tokio::spawn(async move {
+            let mut shutdown = std::pin::pin!(async move {
+                let _ = cancelled.await;
+            });
+            next_batch_or_shutdown(&mut stream, shutdown.as_mut()).await
+        });
+        tokio::task::yield_now().await;
+        cancel.send(()).expect("scanner task is still running");
+
+        assert!(matches!(
+            task.await.expect("scanner task should stop"),
+            NextBatchPoll::Shutdown
+        ));
     }
 }
