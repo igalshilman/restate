@@ -310,10 +310,12 @@ reduces those states before DataFusion's existing repartition and final aggregat
 The first version supports grouped and global `count`, `sum`, `min`, `max`, and `avg`
 when DataFusion can construct the required accumulator for the concrete types, and
 without aggregate filters, ordering, `DISTINCT`, grouping sets, or aggregate TopK. Other
-shapes retain the coordinator-only plan. The wire field is optional; when an older worker
-does not accept the fragment, the client applies the same partial aggregate to its raw
-stream before exposing it upstream. The full contract is documented in
-[Partial Aggregation Pushdown](partial-aggregation-pushdown.md).
+shapes retain the coordinator-only plan. Ordinary SQL `WHERE` predicates are supported:
+DataFusion's residual `FilterExec`, including an embedded projection, is carried in the
+fragment and runs before partial aggregation. The wire field is optional; when an older
+worker does not accept the fragment, the client applies the same filter and partial
+aggregate to its raw stream before exposing it upstream. The full contract is documented
+in [Partial Aggregation Pushdown](partial-aggregation-pushdown.md).
 
 ### Remote Scanner Bottleneck
 

@@ -72,8 +72,9 @@ pub struct RemoteQueryScannerOpen {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_partition_owner: Option<GenerationalNodeId>,
     /// Optional partial aggregate to apply before returning records. The fragment
-    /// is a DataFusion physical `AggregateExec` with an empty input, restricted
-    /// to the state ABI and aggregate allowlist understood by the receiver.
+    /// is a restricted DataFusion physical `AggregateExec` over either an empty
+    /// input or one residual `FilterExec` over an empty input. The receiver also
+    /// validates the accumulator-state ABI and aggregate allowlist.
     ///
     /// **Since v1.8**
     #[bilrost(tag(10))]

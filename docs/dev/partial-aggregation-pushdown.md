@@ -182,13 +182,13 @@ ownership snapshots.
 
 `RemoteQueryScannerOpen.expected_partition_owner` is optional bilrost tag 9 and is
 omitted from flexbuffers when unset
-(`crates/types/src/net/remote_query_scanner.rs:65-81`). It is unset for node-level scans,
+(`crates/types/src/net/remote_query_scanner.rs:65-73`). It is unset for node-level scans,
 which use the scanner protocol but are not partition-routed.
 
 The field is additive. Compatibility coverage verifies that an old-shape bilrost message
 can be decoded by the new type, that the old type skips tag 9, and that the flexbuffers
 encoding is unchanged when the field is absent
-(`crates/types/src/net/remote_query_scanner.rs:325-396`).
+(`crates/types/src/net/remote_query_scanner.rs:325-376`).
 
 ## 6. Pull execution and backpressure
 
@@ -258,8 +258,11 @@ Because there is no read-ahead, the parent TopK has processed the preceding batc
 the next generation snapshot. The server applies an updated predicate before polling its
 next batch (`crates/storage-query-datafusion/src/scanner_task.rs:201-233`).
 
-The plan-shape test proves that DataFusion's TopK filter reaches the opaque remote scan at
-`crates/storage-query-datafusion/src/table_providers.rs:1365-1409`.
+The plan-shape test proves that DataFusion's TopK filter reaches the opaque remote scan and
+survives the later partial-aggregation rule at
+`crates/storage-query-datafusion/src/table_providers.rs:1366-1413`. Generation-update
+coverage verifies that a changed predicate is serialized once for the next pull at
+`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:508-562`.
 
 Partial aggregation does not replace this mechanism. A remote fragment must keep the
 dynamic predicate below the aggregate so filtering still applies to raw rows. Queries
@@ -283,9 +286,11 @@ Before
 AggregateExec: FinalPartitioned
 └── RepartitionExec: Hash(group keys)
     └── AggregateExec: Partial
-        └── LocationAwareScanExec
-            ├── PartitionScanExec: Local
-            └── RemoteNodeExec: N2
+        └── FilterExec: residual SQL predicate (optional)
+            └── RepartitionExec: RoundRobinBatch (optional)
+                └── LocationAwareScanExec
+                    ├── PartitionScanExec: Local
+                    └── RemoteNodeExec: N2
 
 After
 -----
@@ -294,7 +299,8 @@ AggregateExec: FinalPartitioned
     └── AggregateExec: PartialReduce
         └── LocationAwareScanExec: output=accumulator state
             ├── AggregateExec: Partial
-            │   └── PartitionScanExec: Local
+            │   └── FilterExec: residual SQL predicate (optional)
+            │       └── PartitionScanExec: Local
             └── RemoteNodeExec: N2, fragment=PartialAggregate
 ```
 
@@ -310,8 +316,11 @@ the following are true:
 
 - the candidate is a DataFusion `AggregateExec` in `Partial` mode;
 - its input reaches a `LocationAwareScanExec` containing a remote branch, or a direct
-  `RemoteNodeExec`, through at most the round-robin `RepartitionExec` inserted by
-  DataFusion;
+  `RemoteNodeExec`, through at most one residual `FilterExec` and the round-robin
+  `RepartitionExec` inserted by DataFusion, in either order;
+- a residual filter has no fetch limit, its predicate is non-volatile and serializable,
+  and any embedded projection produces exactly the schema expected by the partial
+  aggregate;
 - the scan has no pushed limit;
 - there is one ordinary grouping set;
 - aggregate functions are from the initial built-in allowlist: `count`, `sum`, `min`,
@@ -328,14 +337,16 @@ Unsupported shapes remain unchanged and execute with the ordinary scan plan. Eli
 is an optimization decision, not a new query-validity rule. Local-only scans are also
 left unchanged because moving their existing partial aggregate provides no distributed
 execution benefit. The rule and eligibility checks are implemented at
-`crates/storage-query-datafusion/src/partial_aggregation.rs:106-169` and `:347-419`.
+`crates/storage-query-datafusion/src/partial_aggregation.rs:147-230` and `:434-531`.
 
-`PartitionScanExec` stores the provider's static predicate separately from later dynamic
-predicates. This lets the optimizer reason about exact predicate provenance without
-mistaking a best-effort dynamic filter for a removable static `FilterExec`
-(`crates/storage-query-datafusion/src/table_providers.rs:568-577` and `:698-705`). If a
-remaining filter cannot be proven redundant or safely cloned into every branch, the rule
-must skip the rewrite.
+`PartitionScanExec` continues to store the provider's static predicate separately from
+later dynamic predicates (`crates/storage-query-datafusion/src/table_providers.rs:568-577`
+and `:698-705`). The scan-level copy remains useful for pruning, but it is not treated as
+an exact replacement: some `ScanPartition` implementations ignore predicates. The rule
+therefore clones the residual `FilterExec` into every local and remote fragment, before
+the partial aggregate. This preserves DataFusion's exact filtering semantics even when a
+scanner applies no pushed predicate. Filters outside the validated shape still skip the
+rewrite.
 
 ### 9.3 Remote fragment model
 
@@ -346,7 +357,9 @@ general remotely executable child plan:
 struct PartialAggregateFragment {
     group_by: PhysicalGroupBy,
     aggregate: Vec<Arc<AggregateFunctionExpr>>,
-    input_schema: SchemaRef,
+    filter: Option<PartialAggregateFilter>,
+    scan_schema: SchemaRef,
+    aggregate_input_schema: SchemaRef,
     output_schema: SchemaRef,
 }
 ```
@@ -354,7 +367,10 @@ struct PartialAggregateFragment {
 The in-memory fragment is implemented in
 `crates/storage-query-datafusion/src/partial_aggregation.rs`. Its semantic contract is:
 
-- input expressions are evaluated against the raw projected scan schema;
+- the filter predicate is evaluated against the raw projected scan schema, while
+  grouping and aggregate expressions use the post-filter projection schema;
+- an optional exact residual filter, including its embedded projection, runs before the
+  partial aggregate;
 - output is accumulator state, not final values;
 - the output schema is known at planning time;
 - the server reconstructs only allowlisted aggregates;
@@ -365,12 +381,13 @@ The node remains opaque. `with_partial_aggregate` validates the fragment and ret
 new `RemoteNodeExec` with updated schema and plan properties. Generic
 `with_new_children` continues to reject children.
 
-For transport, the fragment constructs a supported `AggregateExec::Partial` over an
-`EmptyExec` carrying the raw input schema and serializes that plan with DataFusion's
-physical protobuf codec. The server accepts only a top-level partial aggregate, reruns
-the allowlist validation after decoding, and verifies both raw input and accumulator
-output schemas. This uses DataFusion's expression and built-in aggregate codecs without
-granting permission to execute an arbitrary serialized physical plan.
+For transport, the fragment constructs a supported `AggregateExec::Partial` over either
+an `EmptyExec` or one validated `FilterExec` over that `EmptyExec`, carrying the raw input
+schema, and serializes the plan with DataFusion's physical protobuf codec. The server
+accepts only those two shapes, reruns the aggregate and filter validation after decoding,
+and verifies the raw input, post-filter aggregate input, and accumulator output schemas.
+This uses DataFusion's expression and built-in aggregate codecs without granting
+permission to execute an arbitrary serialized physical plan.
 
 ### 9.4 Wire negotiation and fallback
 
@@ -378,7 +395,7 @@ granting permission to execute an arbitrary serialized physical plan.
 state ABI, serialized partial plan, and expected accumulator-state schema. Acceptance is
 reported with `RemoteQueryScannerOpened::SuccessWithPartialAggregate`; the original
 `Success` variant means that the scanner opened but the fragment was not applied
-(`crates/types/src/net/remote_query_scanner.rs:74-132`).
+(`crates/types/src/net/remote_query_scanner.rs:74-133`).
 
 Execution then proceeds as follows:
 
@@ -389,8 +406,8 @@ Execution then proceeds as follows:
    batches;
 4. if unsupported before execution, it returns the original `Success` and streams raw
    batches;
-5. the client applies the same partial aggregate locally to an unapplied raw stream, so
-   the outward `RemoteNodeExec` schema remains accumulator state;
+5. the client applies the same residual filter and partial aggregate locally to an
+   unapplied raw stream, so the outward `RemoteNodeExec` schema remains accumulator state;
 6. an error after `applied=true` fails the query because raw input may already have been
    consumed.
 
@@ -409,8 +426,10 @@ the raw stream once with a local `AggregateExec::Partial`.
 
 The server constructs the ordinary local partition scan first, installs the static and
 dynamic predicate below the fragment, and then wraps the stream with the reconstructed
-partial aggregate. It uses the server's query `TaskContext`, so allocations are charged
-to its DataFusion memory pool.
+exact filter and partial aggregate. The exact filter can duplicate scan-level pruning,
+which is intentional because scan predicate handling is not part of the `ScanPartition`
+correctness contract. The fragment uses the server's query `TaskContext`, so allocations
+are charged to its DataFusion memory pool.
 
 Explicit fragment admission accounting remains an operational follow-up. Today fragment
 memory is governed by the server query context's DataFusion memory pool, but there is no
@@ -492,16 +511,17 @@ and accepted/declined metrics.
 
 The foundation has high-signal tests for placement isolation, the explicit remote plan
 shape, global statistics, TopK filter propagation, and tag-9 compatibility at
-`crates/storage-query-datafusion/src/table_providers.rs:1238-1409` and
-`crates/types/src/net/remote_query_scanner.rs:325-396`.
+`crates/storage-query-datafusion/src/table_providers.rs:1238-1413` and
+`crates/types/src/net/remote_query_scanner.rs:325-394`.
 
 The implemented partial-aggregation coverage includes a mixed-placement plan-shape and
 result-equivalence test for every allowlisted aggregate, fragment codec round-trip
-coverage, rejection of unconstructable reduce accumulators, global aggregation coverage,
-TopK propagation coverage, and protocol compatibility tests. The implementation was also
-verified manually with three-node `EXPLAIN ANALYZE`. The remaining matrix should add:
+coverage, filtered grouped aggregation, filtered `COUNT(*)` with an embedded filter
+projection, a scanner that ignores pushed predicates, rejection of unconstructable reduce
+accumulators, global aggregation coverage, TopK propagation coverage, and protocol
+compatibility tests. The implementation was also verified manually with three-node
+`EXPLAIN ANALYZE`. The remaining matrix should add:
 
-- plan-shape tests for global and grouped aggregation;
 - identical result tests for local-only, remote-only, and mixed placement;
 - empty-input tests, especially global aggregation's single output row;
 - supported null behavior across the aggregate allowlist;

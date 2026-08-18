@@ -1228,6 +1228,7 @@ mod tests {
     use restate_types::errors::GenericError;
 
     use super::*;
+    use crate::partial_aggregation::PartialAggregationPushdown;
 
     fn physical_partition(id: u16) -> (PartitionId, Partition) {
         let partition_id = PartitionId::new_unchecked(id);
@@ -1395,6 +1396,9 @@ mod tests {
         let optimized = FilterPushdown::new_post_optimization()
             .optimize(sort, &config)
             .expect("TopK filter pushdown should succeed");
+        let optimized = PartialAggregationPushdown
+            .optimize(optimized, &config)
+            .expect("partial aggregation rule should preserve the TopK plan");
         let scan = optimized.children()[0]
             .downcast_ref::<LocationAwareScanExec>()
             .expect("sort input should remain a location-aware scan");

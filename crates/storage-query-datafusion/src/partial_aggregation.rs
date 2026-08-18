@@ -16,13 +16,16 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::projection::ProjectionRef;
+use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{ExecutionPlan, Partitioning, PhysicalExpr};
 use datafusion_proto::physical_plan::{AsExecutionPlan, DefaultPhysicalExtensionCodec};
 use parking_lot::Mutex;
 use prost::Message;
@@ -44,8 +47,44 @@ pub(crate) const PARTIAL_AGGREGATE_STATE_ABI: u32 = 1;
 pub(crate) struct PartialAggregateFragment {
     group_by: PhysicalGroupBy,
     aggregate: Vec<Arc<datafusion::physical_plan::udaf::AggregateFunctionExpr>>,
-    input_schema: SchemaRef,
+    filter: Option<PartialAggregateFilter>,
+    scan_schema: SchemaRef,
+    aggregate_input_schema: SchemaRef,
     output_schema: SchemaRef,
+}
+
+#[derive(Clone, Debug)]
+struct PartialAggregateFilter {
+    predicate: Arc<dyn PhysicalExpr>,
+    projection: Option<ProjectionRef>,
+    default_selectivity: u8,
+    batch_size: usize,
+}
+
+impl PartialAggregateFilter {
+    fn from_exec(filter: &FilterExec, expected_aggregate_input_schema: &SchemaRef) -> Option<Self> {
+        if filter.fetch().is_some()
+            || is_volatile(filter.predicate())
+            || filter.schema() != *expected_aggregate_input_schema
+        {
+            return None;
+        }
+        Some(Self {
+            predicate: Arc::clone(filter.predicate()),
+            projection: filter.projection().clone(),
+            default_selectivity: filter.default_selectivity(),
+            batch_size: filter.batch_size(),
+        })
+    }
+
+    fn create_exec(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        let filter = FilterExecBuilder::new(Arc::clone(&self.predicate), input)
+            .with_default_selectivity(self.default_selectivity)
+            .with_batch_size(self.batch_size)
+            .apply_projection_by_ref(self.projection.as_ref())?
+            .build()?;
+        Ok(Arc::new(filter))
+    }
 }
 
 #[derive(Clone)]
@@ -97,7 +136,9 @@ impl Debug for PartialAggregateFragment {
                     .map(|aggregate| aggregate.name())
                     .collect::<Vec<_>>(),
             )
-            .field("input_schema", &self.input_schema)
+            .field("filter", &self.filter)
+            .field("scan_schema", &self.scan_schema)
+            .field("aggregate_input_schema", &self.aggregate_input_schema)
             .field("output_schema", &self.output_schema)
             .finish()
     }
@@ -106,16 +147,34 @@ impl Debug for PartialAggregateFragment {
 impl PartialAggregateFragment {
     /// Returns `None` when the aggregate is outside the allowlist or its
     /// accumulator state cannot be safely reduced and encoded for a peer.
-    pub(crate) fn from_aggregate(aggregate: &AggregateExec) -> Option<Self> {
-        let fragment = Self::from_supported_aggregate(aggregate)?;
+    pub(crate) fn from_aggregate(
+        aggregate: &AggregateExec,
+        filter: Option<&FilterExec>,
+    ) -> Option<Self> {
+        let aggregate_input_schema = aggregate.input_schema();
+        let (filter, scan_schema) = match filter {
+            Some(filter) => (
+                Some(PartialAggregateFilter::from_exec(
+                    filter,
+                    &aggregate_input_schema,
+                )?),
+                filter.input().schema(),
+            ),
+            None => (None, Arc::clone(&aggregate_input_schema)),
+        };
+        let fragment = Self::from_supported_aggregate(aggregate, filter, scan_schema)?;
 
-        // Prove at planning time that every grouping and aggregate argument is
-        // representable by the physical protobuf codec used on the wire.
+        // Prove at planning time that the filter, grouping, and aggregate
+        // expressions are representable by the physical protobuf codec.
         fragment.to_wire().ok()?;
         Some(fragment)
     }
 
-    fn from_supported_aggregate(aggregate: &AggregateExec) -> Option<Self> {
+    fn from_supported_aggregate(
+        aggregate: &AggregateExec,
+        filter: Option<PartialAggregateFilter>,
+        scan_schema: SchemaRef,
+    ) -> Option<Self> {
         let group_by = aggregate.group_expr();
         let global_grouping = group_by.is_true_no_grouping();
         let ordinary_grouping = global_grouping
@@ -164,7 +223,9 @@ impl PartialAggregateFragment {
         Some(Self {
             group_by: aggregate.group_expr().clone(),
             aggregate: aggregate.aggr_expr().to_vec(),
-            input_schema: aggregate.input_schema(),
+            filter,
+            scan_schema,
+            aggregate_input_schema: aggregate.input_schema(),
             output_schema: aggregate.schema(),
         })
     }
@@ -177,21 +238,32 @@ impl PartialAggregateFragment {
         &self,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if input.schema() != self.input_schema {
+        if input.schema() != self.scan_schema {
             return internal_err!(
                 "partial aggregate input schema mismatch: expected {:?}, got {:?}",
-                self.input_schema,
+                self.scan_schema,
                 input.schema()
             );
         }
 
+        let input = match &self.filter {
+            Some(filter) => filter.create_exec(input)?,
+            None => input,
+        };
+        if input.schema() != self.aggregate_input_schema {
+            return internal_err!(
+                "partial aggregate filtered input schema mismatch: expected {:?}, got {:?}",
+                self.aggregate_input_schema,
+                input.schema()
+            );
+        }
         let aggregate = AggregateExec::try_new(
             AggregateMode::Partial,
             self.group_by.clone(),
             self.aggregate.clone(),
             vec![None; self.aggregate.len()],
             input,
-            Arc::clone(&self.input_schema),
+            Arc::clone(&self.aggregate_input_schema),
         )?;
         if aggregate.schema() != self.output_schema {
             return internal_err!(
@@ -235,7 +307,7 @@ impl PartialAggregateFragment {
             self.aggregate.clone(),
             vec![None; self.aggregate.len()],
             input,
-            Arc::clone(&self.input_schema),
+            Arc::clone(&self.aggregate_input_schema),
         )?;
         if aggregate.schema() != self.output_schema {
             return internal_err!(
@@ -253,11 +325,11 @@ impl PartialAggregateFragment {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let partition = Arc::new(OneShotPartitionStream {
-            schema: Arc::clone(&self.input_schema),
+            schema: Arc::clone(&self.scan_schema),
             stream: Mutex::new(Some(stream)),
         });
         let input = Arc::new(StreamingTableExec::try_new(
-            Arc::clone(&self.input_schema),
+            Arc::clone(&self.scan_schema),
             vec![partition],
             None,
             [],
@@ -269,7 +341,7 @@ impl PartialAggregateFragment {
 
     pub(crate) fn to_wire(&self) -> Result<RemoteQueryScannerPartialAggregate> {
         let placeholder =
-            Arc::new(EmptyExec::new(Arc::clone(&self.input_schema))) as Arc<dyn ExecutionPlan>;
+            Arc::new(EmptyExec::new(Arc::clone(&self.scan_schema))) as Arc<dyn ExecutionPlan>;
         let aggregate = self.create_partial_exec(placeholder)?;
         let plan = datafusion_proto::protobuf::PhysicalPlanNode::try_from_physical_plan(
             aggregate,
@@ -286,7 +358,7 @@ impl PartialAggregateFragment {
     pub(crate) fn from_wire(
         wire: &RemoteQueryScannerPartialAggregate,
         context: &TaskContext,
-        input_schema: &SchemaRef,
+        expected_scan_schema: &SchemaRef,
     ) -> Result<Option<Self>> {
         if wire.state_abi != PARTIAL_AGGREGATE_STATE_ABI {
             return Ok(None);
@@ -303,13 +375,28 @@ impl PartialAggregateFragment {
         let Some(aggregate) = plan.downcast_ref::<AggregateExec>() else {
             return Ok(None);
         };
-        if aggregate.input().downcast_ref::<EmptyExec>().is_none() {
-            return Ok(None);
-        }
-        let Some(fragment) = Self::from_supported_aggregate(aggregate) else {
+        let (filter, decoded_scan_schema) =
+            if let Some(filter) = aggregate.input().downcast_ref::<FilterExec>() {
+                let Some(filter_fragment) =
+                    PartialAggregateFilter::from_exec(filter, &aggregate.input_schema())
+                else {
+                    return Ok(None);
+                };
+                if filter.input().downcast_ref::<EmptyExec>().is_none() {
+                    return Ok(None);
+                }
+                (Some(filter_fragment), filter.input().schema())
+            } else {
+                if aggregate.input().downcast_ref::<EmptyExec>().is_none() {
+                    return Ok(None);
+                }
+                (None, aggregate.input().schema())
+            };
+        let Some(fragment) = Self::from_supported_aggregate(aggregate, filter, decoded_scan_schema)
+        else {
             return Ok(None);
         };
-        if fragment.input_schema != *input_schema
+        if fragment.scan_schema != *expected_scan_schema
             || fragment.output_schema != expected_output_schema
         {
             return Ok(None);
@@ -374,13 +461,8 @@ fn rewrite_partial_aggregate(
         return Ok(Transformed::no(plan));
     };
 
-    let scan = if let Some(repartition) = aggregate.input().downcast_ref::<RepartitionExec>() {
-        if !matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_)) {
-            return Ok(Transformed::no(plan));
-        }
-        Arc::clone(repartition.input())
-    } else {
-        Arc::clone(aggregate.input())
+    let Some((scan, filter)) = extract_fragment_input(aggregate) else {
+        return Ok(Transformed::no(plan));
     };
 
     if let Some(scan) = scan.downcast_ref::<LocationAwareScanExec>() {
@@ -396,7 +478,8 @@ fn rewrite_partial_aggregate(
         return Ok(Transformed::no(plan));
     }
 
-    let Some(fragment) = PartialAggregateFragment::from_aggregate(aggregate) else {
+    let Some(fragment) = PartialAggregateFragment::from_aggregate(aggregate, filter.as_ref())
+    else {
         return Ok(Transformed::no(plan));
     };
     let fragment = Arc::new(fragment);
@@ -419,6 +502,34 @@ fn rewrite_partial_aggregate(
     Ok(Transformed::yes(reduced))
 }
 
+fn extract_fragment_input(
+    aggregate: &AggregateExec,
+) -> Option<(Arc<dyn ExecutionPlan>, Option<FilterExec>)> {
+    let mut scan = Arc::clone(aggregate.input());
+    let mut filter = None;
+    let mut has_repartition = false;
+    loop {
+        if let Some(candidate) = scan.downcast_ref::<FilterExec>() {
+            if filter.is_some() {
+                return None;
+            }
+            filter = Some(candidate.clone());
+            scan = Arc::clone(candidate.input());
+        } else if let Some(repartition) = scan.downcast_ref::<RepartitionExec>() {
+            if has_repartition
+                || !matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
+            {
+                return None;
+            }
+            has_repartition = true;
+            scan = Arc::clone(repartition.input());
+        } else {
+            break;
+        }
+    }
+    Some((scan, filter))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -439,6 +550,7 @@ mod tests {
     use datafusion::physical_plan::expressions::Literal;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::physical_plan::metrics::Time;
+    use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
 
     use restate_types::GenerationalNodeId;
@@ -492,7 +604,7 @@ mod tests {
             &self,
             partition_id: PartitionId,
             _range: KeyRange,
-            _projection: SchemaRef,
+            projection: SchemaRef,
             _predicate: Option<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
             _batch_size: usize,
             _limit: Option<usize>,
@@ -510,9 +622,15 @@ mod tests {
                     Arc::new(Float64Array::from(values.to_vec())),
                 ],
             )?;
+            let indices = projection
+                .fields()
+                .iter()
+                .map(|field| self.schema.index_of(field.name()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let batch = batch.project(&indices)?;
             Ok(Box::pin(MemoryStream::try_new(
                 vec![batch],
-                Arc::clone(&self.schema),
+                projection,
                 None,
             )?))
         }
@@ -558,8 +676,36 @@ mod tests {
             .expect("floating-point aggregate values")
     }
 
+    fn find_partial_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<AggregateExec> {
+        if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+            && aggregate.mode() == &AggregateMode::Partial
+        {
+            return Some(aggregate.clone());
+        }
+        plan.children().into_iter().find_map(find_partial_aggregate)
+    }
+
+    fn aggregation_test_context() -> SessionContext {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let provider = PartitionedTableProvider::new(
+            TwoPartitions,
+            Arc::clone(&schema),
+            Vec::new(),
+            LocatedTestScanner { schema },
+            FirstMatchingPartitionKeyExtractor::default(),
+        );
+        let context = SessionContext::new();
+        context
+            .register_table("test_values", Arc::new(provider))
+            .expect("register test table");
+        context
+    }
+
     #[tokio::test]
-    async fn pushes_partial_aggregate_into_local_and_remote_branches() {
+    async fn pushes_filtered_partial_aggregate_into_local_and_remote_branches() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("group", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
@@ -574,10 +720,29 @@ mod tests {
             FirstMatchingPartitionKeyExtractor::default(),
         );
         let context = SessionContext::new();
+        let logical_filter = col("value").gt(lit(6.0));
         let scan = provider
-            .scan(&context.state(), None, &[], None)
+            .scan(
+                &context.state(),
+                None,
+                std::slice::from_ref(&logical_filter),
+                None,
+            )
             .await
             .expect("scan plan");
+        let predicate =
+            datafusion::physical_expr::planner::logical2physical(&logical_filter, &schema);
+        let filtered = Arc::new(
+            FilterExecBuilder::new(predicate, scan)
+                .apply_projection(Some(vec![0, 1]))
+                .expect("filter projection")
+                .build()
+                .expect("residual filter"),
+        ) as Arc<dyn ExecutionPlan>;
+        let repartitioned = Arc::new(
+            RepartitionExec::try_new(filtered, Partitioning::RoundRobinBatch(2))
+                .expect("round-robin repartition"),
+        ) as Arc<dyn ExecutionPlan>;
         let group_by = PhysicalGroupBy::new_single(vec![(
             Arc::new(Column::new("group", 0)) as _,
             "group".to_owned(),
@@ -600,33 +765,38 @@ mod tests {
             group_by.clone(),
             aggregates.clone(),
             vec![None; aggregates.len()],
-            scan,
+            repartitioned,
             Arc::clone(&schema),
         )
         .expect("partial aggregate");
+        let residual_filter = partial
+            .input()
+            .downcast_ref::<RepartitionExec>()
+            .expect("round-robin repartition below partial aggregate")
+            .input()
+            .downcast_ref::<FilterExec>()
+            .expect("residual filter below partial aggregate");
         assert!(
             PartialAggregateFragment::from_aggregate(
                 &partial
                     .clone()
-                    .with_limit_options(Some(LimitOptions::new_with_order(10, true)))
+                    .with_limit_options(Some(LimitOptions::new_with_order(10, true))),
+                Some(residual_filter),
             )
             .is_none(),
             "aggregate TopK must retain its existing coordinator plan"
         );
-        let partial = Arc::new(partial) as Arc<dyn ExecutionPlan>;
 
-        let fragment = PartialAggregateFragment::from_aggregate(
-            partial
-                .downcast_ref::<AggregateExec>()
-                .expect("aggregate plan"),
-        )
-        .expect("supported fragment");
+        let fragment = PartialAggregateFragment::from_aggregate(&partial, Some(residual_filter))
+            .expect("supported fragment");
         let wire = fragment.to_wire().expect("fragment serialization");
         let decoded = PartialAggregateFragment::from_wire(&wire, &context.task_ctx(), &schema)
             .expect("fragment deserialization")
             .expect("compatible fragment");
         assert_eq!(decoded.output_schema(), fragment.output_schema());
+        assert!(decoded.filter.is_some());
 
+        let partial = Arc::new(partial) as Arc<dyn ExecutionPlan>;
         let optimized = PartialAggregationPushdown
             .optimize(partial, &ConfigOptions::new())
             .expect("partial aggregation pushdown");
@@ -641,7 +811,10 @@ mod tests {
         assert!(located.children().iter().any(|branch| {
             branch
                 .downcast_ref::<AggregateExec>()
-                .is_some_and(|aggregate| aggregate.mode() == &AggregateMode::Partial)
+                .is_some_and(|aggregate| {
+                    aggregate.mode() == &AggregateMode::Partial
+                        && aggregate.input().downcast_ref::<FilterExec>().is_some()
+                })
         }));
         assert!(located.children().iter().any(|branch| {
             branch
@@ -687,16 +860,127 @@ mod tests {
                 );
             }
         }
-        assert!((result["a"].0 - 33.0).abs() < f64::EPSILON);
-        assert_eq!(result["a"].1, 3);
-        assert!((result["a"].2 - 3.0).abs() < f64::EPSILON);
+        assert!((result["a"].0 - 30.0).abs() < f64::EPSILON);
+        assert_eq!(result["a"].1, 2);
+        assert!((result["a"].2 - 10.0).abs() < f64::EPSILON);
         assert!((result["a"].3 - 20.0).abs() < f64::EPSILON);
-        assert!((result["a"].4 - 11.0).abs() < f64::EPSILON);
-        assert!((result["b"].0 - 20.0).abs() < f64::EPSILON);
-        assert_eq!(result["b"].1, 3);
-        assert!((result["b"].2 - 5.0).abs() < f64::EPSILON);
+        assert!((result["a"].4 - 15.0).abs() < f64::EPSILON);
+        assert!((result["b"].0 - 15.0).abs() < f64::EPSILON);
+        assert_eq!(result["b"].1, 2);
+        assert!((result["b"].2 - 7.0).abs() < f64::EPSILON);
         assert!((result["b"].3 - 8.0).abs() < f64::EPSILON);
-        assert!((result["b"].4 - (20.0 / 3.0)).abs() < f64::EPSILON);
+        assert!((result["b"].4 - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn sql_filter_is_applied_before_partial_aggregation() {
+        let context = aggregation_test_context();
+
+        let plan = context
+            .sql(
+                r#"SELECT "group", SUM(value) AS total
+                   FROM test_values
+                   WHERE value > 6
+                   GROUP BY "group""#,
+            )
+            .await
+            .expect("filtered aggregate query")
+            .create_physical_plan()
+            .await
+            .expect("filtered aggregate plan");
+        let optimized = PartialAggregationPushdown
+            .optimize(plan, &ConfigOptions::new())
+            .expect("filtered partial aggregation pushdown");
+        let display = datafusion::physical_plan::displayable(optimized.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(display.contains("mode=PartialReduce"), "{display}");
+        assert!(
+            display.contains("RemoteNodeExec: target_node=N2:1, fragment=PartialAggregate"),
+            "{display}"
+        );
+
+        let batches = datafusion::physical_plan::collect(optimized, context.task_ctx())
+            .await
+            .expect("filtered aggregate result");
+        let mut result = BTreeMap::new();
+        for batch in batches {
+            let groups = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("group strings");
+            let totals = float64_column(&batch, 1);
+            for row in 0..batch.num_rows() {
+                result.insert(groups.value(row).to_owned(), totals.value(row));
+            }
+        }
+        assert_eq!(
+            result,
+            BTreeMap::from([("a".to_owned(), 30.0), ("b".to_owned(), 15.0)])
+        );
+
+        let count_plan = context
+            .sql("SELECT COUNT(*) AS total FROM test_values WHERE value > 6")
+            .await
+            .expect("filtered count query")
+            .create_physical_plan()
+            .await
+            .expect("filtered count plan");
+        let partial = find_partial_aggregate(&count_plan).expect("partial count aggregate");
+        let (scan, filter) = extract_fragment_input(&partial).expect("count fragment input");
+        let fragment = PartialAggregateFragment::from_aggregate(&partial, filter.as_ref())
+            .expect("filtered count fragment");
+        let wire = fragment.to_wire().expect("filtered count serialization");
+        let decoded =
+            PartialAggregateFragment::from_wire(&wire, &context.task_ctx(), &scan.schema())
+                .expect("filtered count deserialization")
+                .expect("compatible filtered count fragment");
+        assert_eq!(
+            decoded
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.projection.as_deref()),
+            Some([].as_slice())
+        );
+        let count_plan = PartialAggregationPushdown
+            .optimize(count_plan, &ConfigOptions::new())
+            .expect("filtered count pushdown");
+        let display = datafusion::physical_plan::displayable(count_plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(display.contains("mode=PartialReduce"), "{display}");
+        let batches = datafusion::physical_plan::collect(count_plan, context.task_ctx())
+            .await
+            .expect("filtered count result");
+        assert_eq!(int64_column(&batches[0], 0).value(0), 4);
+    }
+
+    #[tokio::test]
+    async fn volatile_filter_is_not_pushed_into_partial_aggregation() {
+        let context = aggregation_test_context();
+        let volatile_plan = context
+            .sql("SELECT COUNT(*) FROM test_values WHERE random() > 0.5")
+            .await
+            .expect("volatile filtered query")
+            .create_physical_plan()
+            .await
+            .expect("volatile filtered plan");
+        let partial = find_partial_aggregate(&volatile_plan).expect("partial aggregate");
+        let (_, filter) = extract_fragment_input(&partial).expect("volatile fragment input");
+        assert!(
+            filter
+                .as_ref()
+                .is_some_and(|filter| is_volatile(filter.predicate()))
+        );
+        let volatile_plan = PartialAggregationPushdown
+            .optimize(volatile_plan, &ConfigOptions::new())
+            .expect("volatile filter remains unchanged");
+        let display = datafusion::physical_plan::displayable(volatile_plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(!display.contains("mode=PartialReduce"), "{display}");
+        assert!(!display.contains("fragment=PartialAggregate"), "{display}");
     }
 
     #[tokio::test]
@@ -801,6 +1085,6 @@ mod tests {
         )
         .expect("partial average");
 
-        assert!(PartialAggregateFragment::from_aggregate(&aggregate).is_none());
+        assert!(PartialAggregateFragment::from_aggregate(&aggregate, None).is_none());
     }
 }

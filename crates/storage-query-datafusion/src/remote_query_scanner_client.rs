@@ -480,3 +480,84 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::{BooleanArray, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{
+        BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal,
+    };
+    use datafusion::scalar::ScalarValue;
+
+    use super::*;
+    use crate::decode_expr;
+
+    fn greater_than(column: &Arc<dyn PhysicalExpr>, value: i64) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::clone(column),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(value)))),
+        ))
+    }
+
+    #[test]
+    fn dynamic_predicate_is_sent_after_generation_update() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let column = Arc::new(Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            greater_than(&column, 10),
+        ));
+        let predicate = Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>;
+        let mut generation = snapshot_generation(&predicate);
+        assert_ne!(generation, 0);
+        assert!(
+            next_predicate(&mut generation, Some(&predicate))
+                .expect("unchanged dynamic predicate")
+                .is_none()
+        );
+
+        dynamic
+            .update(greater_than(&column, 20))
+            .expect("dynamic predicate update");
+        let current_generation = snapshot_generation(&predicate);
+        assert_ne!(current_generation, generation);
+        let update = next_predicate(&mut generation, Some(&predicate))
+            .expect("updated dynamic predicate")
+            .expect("new generation must be sent");
+        assert_eq!(generation, current_generation);
+
+        let decoded = decode_expr(
+            &TaskContext::default(),
+            schema.as_ref(),
+            &update.serialized_physical_expression,
+        )
+        .expect("dynamic predicate payload");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![19, 20, 21]))])
+                .expect("predicate input");
+        let values = decoded
+            .evaluate(&batch)
+            .expect("decoded predicate evaluation")
+            .into_array(batch.num_rows())
+            .expect("decoded predicate values");
+        let values = values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("boolean predicate values");
+        assert_eq!(values, &BooleanArray::from(vec![false, false, true]));
+        assert!(
+            next_predicate(&mut generation, Some(&predicate))
+                .expect("already sent predicate")
+                .is_none()
+        );
+    }
+}
