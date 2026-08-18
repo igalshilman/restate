@@ -29,7 +29,7 @@ use prost::Message;
 
 use restate_types::net::remote_query_scanner::RemoteQueryScannerPartialAggregate;
 
-use crate::table_providers::{LocationAwareScanExec, PartitionScanExec, RemoteNodeExec};
+use crate::table_providers::{LocationAwareScanExec, RemoteNodeExec};
 use crate::{decode_schema, encode_schema};
 
 /// Version of the accumulator-state contract exchanged by partial aggregates.
@@ -67,11 +67,21 @@ impl Debug for PartialAggregateFragment {
 }
 
 impl PartialAggregateFragment {
-    /// Returns `None` for an aggregate shape that is intentionally outside the
-    /// first implementation's allowlist.
-    pub(crate) fn from_aggregate(aggregate: &AggregateExec) -> Result<Option<Self>> {
+    /// Returns `None` when the aggregate is outside the allowlist or its
+    /// accumulator state cannot be safely reduced and encoded for a peer.
+    pub(crate) fn from_aggregate(aggregate: &AggregateExec) -> Option<Self> {
+        let fragment = Self::from_supported_aggregate(aggregate)?;
+
+        // Prove at planning time that every grouping and aggregate argument is
+        // representable by the physical protobuf codec used on the wire.
+        fragment.to_wire().ok()?;
+        Some(fragment)
+    }
+
+    fn from_supported_aggregate(aggregate: &AggregateExec) -> Option<Self> {
         let group_by = aggregate.group_expr();
-        let ordinary_grouping = group_by.is_true_no_grouping()
+        let global_grouping = group_by.is_true_no_grouping();
+        let ordinary_grouping = global_grouping
             || (group_by.groups().len() == 1
                 && group_by
                     .groups()
@@ -85,33 +95,41 @@ impl PartialAggregateFragment {
             || !group_by.null_expr().is_empty()
             || aggregate.filter_expr().iter().any(Option::is_some)
         {
-            return Ok(None);
+            return None;
         }
 
         for expression in aggregate.aggr_expr() {
             if !matches!(
-                expression.fun().name().to_ascii_lowercase().as_str(),
+                expression.fun().name(),
                 "count" | "sum" | "min" | "max" | "avg"
             ) || expression.is_distinct()
                 || expression.ignore_nulls()
                 || expression.is_reversed()
                 || !expression.order_bys().is_empty()
             {
-                return Ok(None);
+                return None;
+            }
+
+            // Preflight the accumulator implementation used by PartialReduce.
+            // Some type combinations are accepted while the physical expression
+            // is built but fail when DataFusion constructs the accumulator.
+            let accumulator_supported =
+                if global_grouping || !expression.groups_accumulator_supported() {
+                    expression.create_accumulator().is_ok()
+                } else {
+                    expression.create_groups_accumulator().is_ok()
+                };
+            if !accumulator_supported {
+                return None;
             }
         }
 
-        let fragment = Self {
+        Some(Self {
             group_by: aggregate.group_expr().clone(),
             aggregate: aggregate.aggr_expr().to_vec(),
             input_schema: aggregate.input_schema(),
             output_schema: aggregate.schema(),
-        };
-
-        // Prove at planning time that every grouping and aggregate argument is
-        // representable by the physical protobuf codec used on the wire.
-        fragment.to_wire()?;
-        Ok(Some(fragment))
+        })
     }
 
     pub(crate) fn output_schema(&self) -> SchemaRef {
@@ -251,7 +269,7 @@ impl PartialAggregateFragment {
         if aggregate.input().downcast_ref::<EmptyExec>().is_none() {
             return Ok(None);
         }
-        let Some(fragment) = Self::from_aggregate(aggregate)? else {
+        let Some(fragment) = Self::from_supported_aggregate(aggregate) else {
             return Ok(None);
         };
         if fragment.input_schema != *input_schema
@@ -318,9 +336,6 @@ fn rewrite_partial_aggregate(
     let Some(aggregate) = plan.downcast_ref::<AggregateExec>() else {
         return Ok(Transformed::no(plan));
     };
-    let Some(fragment) = PartialAggregateFragment::from_aggregate(aggregate)? else {
-        return Ok(Transformed::no(plan));
-    };
 
     let scan = if let Some(repartition) = aggregate.input().downcast_ref::<RepartitionExec>() {
         if !matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_)) {
@@ -331,22 +346,29 @@ fn rewrite_partial_aggregate(
         Arc::clone(aggregate.input())
     };
 
-    let rewritten_scan = if let Some(scan) = scan.downcast_ref::<LocationAwareScanExec>() {
-        if !scan.can_push_partial_aggregate() || !scan.has_remote_branch() {
+    if let Some(scan) = scan.downcast_ref::<LocationAwareScanExec>() {
+        if !scan.supports_partial_aggregate() {
             return Ok(Transformed::no(plan));
         }
-        scan.with_partial_aggregate(Arc::new(fragment.clone()))?
     } else if let Some(remote) = scan.downcast_ref::<RemoteNodeExec>() {
         if remote.has_limit() {
             return Ok(Transformed::no(plan));
         }
-        remote.with_partial_aggregate(Arc::new(fragment.clone()))?
-    } else if scan.downcast_ref::<PartitionScanExec>().is_some() {
-        // A local-only branch already executes the partial aggregate on the
-        // coordinator and gains nothing from this distributed rewrite.
-        return Ok(Transformed::no(plan));
     } else {
+        // Local-only and unrelated inputs gain nothing from this rewrite.
         return Ok(Transformed::no(plan));
+    }
+
+    let Some(fragment) = PartialAggregateFragment::from_aggregate(aggregate) else {
+        return Ok(Transformed::no(plan));
+    };
+    let fragment = Arc::new(fragment);
+    let rewritten_scan = if let Some(scan) = scan.downcast_ref::<LocationAwareScanExec>() {
+        scan.with_partial_aggregate(Arc::clone(&fragment))?
+    } else if let Some(remote) = scan.downcast_ref::<RemoteNodeExec>() {
+        remote.with_partial_aggregate(Arc::clone(&fragment))?
+    } else {
+        unreachable!("remote placement was validated above")
     };
 
     let reduced = fragment.create_partial_reduce_exec(rewritten_scan)?;
@@ -365,7 +387,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::TableProvider;
@@ -439,16 +461,16 @@ mod tests {
             _limit: Option<usize>,
             _elapsed_compute: Time,
         ) -> anyhow::Result<SendableRecordBatchStream> {
-            let (groups, values): (&[&str], &[i64]) = if partition_id == PartitionId::MIN {
-                (&["a", "a", "b"], &[10, 20, 5])
+            let (groups, values): (&[&str], &[f64]) = if partition_id == PartitionId::MIN {
+                (&["a", "a", "b"], &[10.0, 20.0, 5.0])
             } else {
-                (&["a", "b", "b"], &[3, 7, 8])
+                (&["a", "b", "b"], &[3.0, 7.0, 8.0])
             };
             let batch = RecordBatch::try_new(
                 Arc::clone(&self.schema),
                 vec![
                     Arc::new(StringArray::from(groups.to_vec())),
-                    Arc::new(Int64Array::from(values.to_vec())),
+                    Arc::new(Float64Array::from(values.to_vec())),
                 ],
             )?;
             Ok(Box::pin(MemoryStream::try_new(
@@ -481,11 +503,27 @@ mod tests {
         }
     }
 
+    fn int64_column(batch: &RecordBatch, index: usize) -> &Int64Array {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("integer aggregate values")
+    }
+
+    fn float64_column(batch: &RecordBatch, index: usize) -> &Float64Array {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("floating-point aggregate values")
+    }
+
     #[tokio::test]
     async fn pushes_partial_aggregate_into_local_and_remote_branches() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("group", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
         ]));
         let provider = PartitionedTableProvider::new(
             TwoPartitions,
@@ -505,18 +543,24 @@ mod tests {
             Arc::new(Column::new("group", 0)) as _,
             "group".to_owned(),
         )]);
-        let sum = Arc::new(
-            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("value", 1))])
-                .schema(Arc::clone(&schema))
-                .alias("sum(value)")
-                .build()
-                .expect("sum expression"),
-        );
+        let aggregates = [sum_udaf(), count_udaf(), min_udaf(), max_udaf(), avg_udaf()]
+            .into_iter()
+            .map(|function| {
+                let name = function.name().to_owned();
+                Arc::new(
+                    AggregateExprBuilder::new(function, vec![Arc::new(Column::new("value", 1))])
+                        .schema(Arc::clone(&schema))
+                        .alias(name)
+                        .build()
+                        .expect("aggregate expression"),
+                )
+            })
+            .collect::<Vec<_>>();
         let partial = AggregateExec::try_new(
             AggregateMode::Partial,
             group_by.clone(),
-            vec![sum.clone()],
-            vec![None],
+            aggregates.clone(),
+            vec![None; aggregates.len()],
             scan,
             Arc::clone(&schema),
         )
@@ -527,7 +571,6 @@ mod tests {
                     .clone()
                     .with_limit_options(Some(LimitOptions::new_with_order(10, true)))
             )
-            .expect("limited aggregate validation")
             .is_none(),
             "aggregate TopK must retain its existing coordinator plan"
         );
@@ -538,7 +581,6 @@ mod tests {
                 .downcast_ref::<AggregateExec>()
                 .expect("aggregate plan"),
         )
-        .expect("fragment validation")
         .expect("supported fragment");
         let wire = fragment.to_wire().expect("fragment serialization");
         let decoded = PartialAggregateFragment::from_wire(&wire, &context.task_ctx(), &schema)
@@ -576,8 +618,8 @@ mod tests {
                     Arc::new(Column::new("group", 0)) as _,
                     "group".to_owned(),
                 )]),
-                vec![sum],
-                vec![None],
+                aggregates.clone(),
+                vec![None; aggregates.len()],
                 coalesced,
                 schema,
             )
@@ -593,26 +635,36 @@ mod tests {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("group strings");
-            let values = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("sum values");
             for row in 0..batch.num_rows() {
-                result.insert(groups.value(row).to_owned(), values.value(row));
+                result.insert(
+                    groups.value(row).to_owned(),
+                    (
+                        float64_column(&batch, 1).value(row),
+                        int64_column(&batch, 2).value(row),
+                        float64_column(&batch, 3).value(row),
+                        float64_column(&batch, 4).value(row),
+                        float64_column(&batch, 5).value(row),
+                    ),
+                );
             }
         }
-        assert_eq!(
-            result,
-            BTreeMap::from([("a".to_owned(), 33), ("b".to_owned(), 20)])
-        );
+        assert!((result["a"].0 - 33.0).abs() < f64::EPSILON);
+        assert_eq!(result["a"].1, 3);
+        assert!((result["a"].2 - 3.0).abs() < f64::EPSILON);
+        assert!((result["a"].3 - 20.0).abs() < f64::EPSILON);
+        assert!((result["a"].4 - 11.0).abs() < f64::EPSILON);
+        assert!((result["b"].0 - 20.0).abs() < f64::EPSILON);
+        assert_eq!(result["b"].1, 3);
+        assert!((result["b"].2 - 5.0).abs() < f64::EPSILON);
+        assert!((result["b"].3 - 8.0).abs() < f64::EPSILON);
+        assert!((result["b"].4 - (20.0 / 3.0)).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
     async fn pushes_global_partial_aggregate_and_preserves_single_result() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("group", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
         ]));
         let provider = PartitionedTableProvider::new(
             TwoPartitions,
@@ -685,43 +737,31 @@ mod tests {
     }
 
     #[test]
-    fn all_allowlisted_aggregates_round_trip() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            true,
-        )]));
-        let context = SessionContext::new();
-
-        for aggregate_function in [count_udaf(), sum_udaf(), min_udaf(), max_udaf(), avg_udaf()] {
-            let name = aggregate_function.name().to_owned();
-            let expression = Arc::new(
-                AggregateExprBuilder::new(
-                    aggregate_function,
-                    vec![Arc::new(Column::new("value", 0))],
-                )
+    fn skips_unconstructable_partial_reduce_accumulator() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let average = Arc::new(
+            AggregateExprBuilder::new(avg_udaf(), vec![Arc::new(Column::new("value", 1))])
                 .schema(Arc::clone(&schema))
-                .alias(name.clone())
+                .alias("avg")
                 .build()
-                .expect("allowlisted aggregate expression"),
-            );
-            let aggregate = AggregateExec::try_new(
-                AggregateMode::Partial,
-                PhysicalGroupBy::default(),
-                vec![expression],
-                vec![None],
-                Arc::new(EmptyExec::new(Arc::clone(&schema))),
-                Arc::clone(&schema),
-            )
-            .expect("allowlisted aggregate plan");
-            let fragment = PartialAggregateFragment::from_aggregate(&aggregate)
-                .expect("allowlisted aggregate validation")
-                .unwrap_or_else(|| panic!("{name} should be allowlisted"));
-            let wire = fragment.to_wire().expect("allowlisted aggregate encoding");
-            let decoded = PartialAggregateFragment::from_wire(&wire, &context.task_ctx(), &schema)
-                .expect("allowlisted aggregate decoding")
-                .unwrap_or_else(|| panic!("{name} should decode"));
-            assert_eq!(decoded.output_schema(), fragment.output_schema());
-        }
+                .expect("average expression"),
+        );
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(vec![(
+                Arc::new(Column::new("group", 0)) as _,
+                "group".to_owned(),
+            )]),
+            vec![average],
+            vec![None],
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            schema,
+        )
+        .expect("partial average");
+
+        assert!(PartialAggregateFragment::from_aggregate(&aggregate).is_none());
     }
 }

@@ -310,21 +310,19 @@ impl LocationAwareScanExec {
         }))
     }
 
-    pub(crate) fn has_remote_branch(&self) -> bool {
-        self.inputs
-            .iter()
-            .any(|input| input.downcast_ref::<RemoteNodeExec>().is_some())
-    }
-
-    pub(crate) fn can_push_partial_aggregate(&self) -> bool {
-        self.inputs.iter().all(|input| {
-            input
-                .downcast_ref::<PartitionScanExec>()
-                .is_some_and(|scan| scan.limit.is_none())
-                || input
-                    .downcast_ref::<RemoteNodeExec>()
-                    .is_some_and(|remote| !remote.has_limit())
-        })
+    pub(crate) fn supports_partial_aggregate(&self) -> bool {
+        let mut has_remote_branch = false;
+        let supported = self.inputs.iter().all(|input| {
+            if let Some(scan) = input.downcast_ref::<PartitionScanExec>() {
+                return scan.limit.is_none();
+            }
+            if let Some(remote) = input.downcast_ref::<RemoteNodeExec>() {
+                has_remote_branch = true;
+                return !remote.has_limit();
+            }
+            false
+        });
+        supported && has_remote_branch
     }
 
     pub(crate) fn with_partial_aggregate(
@@ -567,8 +565,8 @@ where
 
             inputs.push(match location {
                 PartitionLocation::Local => Arc::new(scan) as Arc<dyn ExecutionPlan>,
-                PartitionLocation::Remote { node_id } => {
-                    Arc::new(RemoteNodeExec::new(node_id, scan)) as Arc<dyn ExecutionPlan>
+                PartitionLocation::Remote { .. } => {
+                    Arc::new(RemoteNodeExec::new(scan)) as Arc<dyn ExecutionPlan>
                 }
             });
         }
@@ -789,21 +787,27 @@ impl PartitionScanExec {
 /// node without rediscovering placement.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteNodeExec {
-    target_node: NodeId,
     scan: PartitionScanExec,
     partial_aggregate: Option<Arc<PartialAggregateFragment>>,
     plan: Arc<PlanProperties>,
 }
 
 impl RemoteNodeExec {
-    fn new(target_node: NodeId, scan: PartitionScanExec) -> Self {
+    fn new(scan: PartitionScanExec) -> Self {
+        debug_assert!(matches!(scan.location, PartitionLocation::Remote { .. }));
         let plan = scan.properties().clone();
         Self {
-            target_node,
             scan,
             partial_aggregate: None,
             plan,
         }
+    }
+
+    fn target_node(&self) -> NodeId {
+        let PartitionLocation::Remote { node_id } = self.scan.location else {
+            unreachable!("RemoteNodeExec always contains a remote partition scan")
+        };
+        node_id
     }
 
     pub(crate) fn has_limit(&self) -> bool {
@@ -821,7 +825,6 @@ impl RemoteNodeExec {
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let partial = fragment.create_partial_exec(Arc::new(self.scan.clone()))?;
         Ok(Arc::new(Self {
-            target_node: self.target_node,
             scan: self.scan.clone(),
             partial_aggregate: Some(fragment),
             plan: partial.properties().clone(),
@@ -903,12 +906,7 @@ impl ExecutionPlan for RemoteNodeExec {
                 .downcast_ref::<PartitionScanExec>()
                 .expect("PartitionScanExec updates preserve their type")
                 .clone();
-            let mut updated = Self::new(self.target_node, updated_scan);
-            updated
-                .partial_aggregate
-                .clone_from(&self.partial_aggregate);
-            updated.plan = self.plan.clone();
-            Arc::new(updated) as Arc<dyn ExecutionPlan>
+            Arc::new(Self::new(updated_scan)) as Arc<dyn ExecutionPlan>
         });
 
         Ok(FilterPushdownPropagation {
@@ -922,14 +920,14 @@ impl DisplayAs for RemoteNodeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "RemoteNodeExec: target_node={}", self.target_node)?;
+                write!(f, "RemoteNodeExec: target_node={}", self.target_node())?;
                 if self.partial_aggregate.is_some() {
                     write!(f, ", fragment=PartialAggregate")?;
                 }
                 Ok(())
             }
             DisplayFormatType::TreeRender => {
-                writeln!(f, "target_node={}", self.target_node)?;
+                writeln!(f, "target_node={}", self.target_node())?;
                 if self.partial_aggregate.is_some() {
                     writeln!(f, "fragment=PartialAggregate")?;
                 }
@@ -1405,7 +1403,7 @@ mod tests {
             .find_map(|child| child.downcast_ref::<RemoteNodeExec>())
             .expect("remote placement should have an explicit boundary");
         assert_eq!(
-            remote.target_node,
+            remote.target_node(),
             NodeId::from(GenerationalNodeId::new(2, 1))
         );
         assert!(remote.children().is_empty());

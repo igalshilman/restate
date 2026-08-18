@@ -343,28 +343,36 @@ impl Stream for RemoteCursorStream {
                             scanner,
                             partial_aggregate_applied,
                         } = opened;
-                        if let Some((fragment, context)) = this.partial_aggregate.take()
-                            && !partial_aggregate_applied
-                        {
-                            let raw_cursor = Self {
-                                schema: Arc::clone(&this.raw_schema),
-                                raw_schema: Arc::clone(&this.raw_schema),
-                                predicate: this.predicate.clone(),
-                                predicate_generation: this.predicate_generation,
-                                partial_aggregate: None,
-                                state: RemoteCursorState::Ready(scanner),
-                            };
-                            match fragment.execute_stream(Box::pin(raw_cursor), context) {
-                                Ok(stream) => {
-                                    this.state = RemoteCursorState::Fallback(stream);
-                                }
-                                Err(error) => {
-                                    this.state = RemoteCursorState::Done;
-                                    return Poll::Ready(Some(Err(error)));
+                        match (this.partial_aggregate.take(), partial_aggregate_applied) {
+                            (Some((fragment, context)), false) => {
+                                let raw_cursor = Self {
+                                    schema: Arc::clone(&this.raw_schema),
+                                    raw_schema: Arc::clone(&this.raw_schema),
+                                    predicate: this.predicate.clone(),
+                                    predicate_generation: this.predicate_generation,
+                                    partial_aggregate: None,
+                                    state: RemoteCursorState::Ready(scanner),
+                                };
+                                match fragment.execute_stream(Box::pin(raw_cursor), context) {
+                                    Ok(stream) => {
+                                        this.state = RemoteCursorState::Fallback(stream);
+                                    }
+                                    Err(error) => {
+                                        this.state = RemoteCursorState::Done;
+                                        return Poll::Ready(Some(Err(error)));
+                                    }
                                 }
                             }
-                        } else {
-                            this.state = RemoteCursorState::Ready(scanner);
+                            (Some(_), true) | (None, false) => {
+                                this.state = RemoteCursorState::Ready(scanner);
+                            }
+                            (None, true) => {
+                                this.state = RemoteCursorState::Done;
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                    "remote scanner applied an unrequested partial aggregate"
+                                        .to_owned(),
+                                ))));
+                            }
                         }
                     }
                     Poll::Ready(Err(error)) => {
@@ -551,30 +559,28 @@ impl<T: TransportConnect> RemoteScannerService for RemoteScannerServiceProxy<T> 
         // that another caller holds under the same id.
         let mut remote_scanner = RemoteScanner::new(scanner_id, connection.clone());
 
-        match open_reply.await {
-            Ok(RemoteQueryScannerOpened::Success { scanner_id }) => {
-                // Server is running Restate <v1.7 so we need to respect
-                // the returned scanner_id
-                if remote_scanner.scanner_id != scanner_id {
-                    remote_scanner.forget();
-                    remote_scanner = RemoteScanner::new(scanner_id, connection.clone())
-                }
-                Ok(OpenedRemoteScanner::new(remote_scanner, false))
-            }
+        let (scanner_id, partial_aggregate_applied) = match open_reply.await {
+            Ok(RemoteQueryScannerOpened::Success { scanner_id }) => (scanner_id, false),
             Ok(RemoteQueryScannerOpened::SuccessWithPartialAggregate { scanner_id }) => {
-                if remote_scanner.scanner_id != scanner_id {
-                    remote_scanner.forget();
-                    remote_scanner = RemoteScanner::new(scanner_id, connection.clone())
-                }
-                Ok(OpenedRemoteScanner::new(remote_scanner, true))
+                (scanner_id, true)
             }
             Ok(RemoteQueryScannerOpened::Failure) => {
                 remote_scanner.forget();
-                Err(DataFusionError::Internal(
+                return Err(DataFusionError::Internal(
                     "Unable to open a remote scanner".to_string(),
-                ))
+                ));
             }
-            Err(e) => Err(DataFusionError::External(e.into())),
+            Err(e) => return Err(DataFusionError::External(e.into())),
+        };
+
+        // A pre-v1.7 server can return a different scanner id.
+        if remote_scanner.scanner_id != scanner_id {
+            remote_scanner.forget();
+            remote_scanner = RemoteScanner::new(scanner_id, connection);
         }
+        Ok(OpenedRemoteScanner::new(
+            remote_scanner,
+            partial_aggregate_applied,
+        ))
     }
 }
