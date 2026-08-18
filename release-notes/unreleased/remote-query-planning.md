@@ -8,8 +8,9 @@ Distributed storage-query physical plans now record local and remote partition p
 explicitly. If partition ownership changes after planning, the query fails instead of
 silently rerouting part of the already planned query. Remote query cancellation also
 interrupts a scanner while it is actively producing the next batch. Eligible `count`,
-`sum`, `min`, `max`, and `avg` partial aggregates now execute at partition owners and
-send accumulator state instead of raw input rows to the query coordinator.
+`sum`, `min`, `max`, and `avg` partial aggregates on supported argument types now execute
+at partition owners and send accumulator state instead of raw input rows to the query
+coordinator.
 
 ### Why This Matters
 

@@ -119,7 +119,7 @@ wrapper would not make an otherwise illegal state unrepresentable.
 ### 4.3 Why `RemoteNodeExec` is opaque
 
 `RemoteNodeExec::children()` returns no children even though the node privately owns its
-`PartitionScanExec` (`crates/storage-query-datafusion/src/table_providers.rs:784-877`).
+`PartitionScanExec` (`crates/storage-query-datafusion/src/table_providers.rs:788-868`).
 This is intentional.
 
 If the scan were exposed as an ordinary child, a default DataFusion rule could insert a
@@ -202,7 +202,7 @@ Opening ──success──► Ready ──downstream poll──► Pulling
 ```
 
 The implementation is in
-`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:166-461`.
+`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:166-471`.
 
 The invariants are:
 
@@ -247,18 +247,18 @@ The remote boundary preserves this mechanism in two places:
 
 1. `RemoteNodeExec` implements the post-optimization filter-pushdown hook and forwards
    the result to its private `PartitionScanExec`, without exposing that scan as an
-   ordinary child (`crates/storage-query-datafusion/src/table_providers.rs:882-920`).
+   ordinary child (`crates/storage-query-datafusion/src/table_providers.rs:885-916`).
 2. The cursor snapshots the predicate generation immediately before every `Next` and
    piggybacks a changed predicate on that pull
-   (`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:375-395` and
-   `:465-489`).
+   (`crates/storage-query-datafusion/src/remote_query_scanner_client.rs:383-403` and
+   `:473-493`).
 
 Because there is no read-ahead, the parent TopK has processed the preceding batch before
 the next generation snapshot. The server applies an updated predicate before polling its
 next batch (`crates/storage-query-datafusion/src/scanner_task.rs:202-240`).
 
 The plan-shape test proves that DataFusion's TopK filter reaches the opaque remote scan at
-`crates/storage-query-datafusion/src/table_providers.rs:1416-1461`.
+`crates/storage-query-datafusion/src/table_providers.rs:1414-1458`.
 
 Partial aggregation does not replace this mechanism. A remote fragment must keep the
 dynamic predicate below the aggregate so filtering still applies to raw rows. Queries
@@ -315,6 +315,8 @@ the following are true:
 - there is one ordinary grouping set;
 - aggregate functions are from the initial built-in allowlist: `count`, `sum`, `min`,
   `max`, and `avg`;
+- DataFusion can construct the row or grouped accumulator that `PartialReduce` will use
+  for the aggregate's concrete argument and result types;
 - there is no `DISTINCT`, aggregate `FILTER`, aggregate ordering, reversed aggregate, or
   unsupported null treatment;
 - every grouping and argument expression can be serialized using the already supported
@@ -325,7 +327,7 @@ Unsupported shapes remain unchanged and execute with the ordinary scan plan. Eli
 is an optimization decision, not a new query-validity rule. Local-only scans are also
 left unchanged because moving their existing partial aggregate provides no distributed
 execution benefit. The rule and eligibility checks are implemented at
-`crates/storage-query-datafusion/src/partial_aggregation.rs:69-115` and `:292-360`.
+`crates/storage-query-datafusion/src/partial_aggregation.rs:69-132` and `:309-382`.
 
 `PartitionScanExec` stores the provider's static predicate separately from later dynamic
 predicates. This lets the optimizer reason about exact predicate provenance without
@@ -489,18 +491,19 @@ and accepted/declined metrics.
 
 The foundation has high-signal tests for placement isolation, the explicit remote plan
 shape, global statistics, TopK filter propagation, and tag-9 compatibility at
-`crates/storage-query-datafusion/src/table_providers.rs:1316-1461` and
+`crates/storage-query-datafusion/src/table_providers.rs:1282-1458` and
 `crates/types/src/net/remote_query_scanner.rs:325-396`.
 
 The implemented partial-aggregation coverage includes a mixed-placement plan-shape and
-result-equivalence test, fragment codec round-trip coverage, global statistics coverage,
+result-equivalence test for every allowlisted aggregate, fragment codec round-trip
+coverage, rejection of unconstructable reduce accumulators, global aggregation coverage,
 TopK propagation coverage, and protocol compatibility tests. The implementation was also
 verified manually with three-node `EXPLAIN ANALYZE`. The remaining matrix should add:
 
 - plan-shape tests for global and grouped aggregation;
 - identical result tests for local-only, remote-only, and mixed placement;
 - empty-input tests, especially global aggregation's single output row;
-- every allowlisted aggregate and supported null behavior;
+- supported null behavior across the aggregate allowlist;
 - explicit non-rewrite tests for every eligibility rejection;
 - server-decline fallback and post-accept failure tests;
 - a fake-transport pull test proving that no second `Next` is sent before another poll;

@@ -308,6 +308,7 @@ return accumulator-state rows instead of all matching input rows, and the coordi
 reduces those states before DataFusion's existing repartition and final aggregate.
 
 The first version supports grouped and global `count`, `sum`, `min`, `max`, and `avg`
+when DataFusion can construct the required accumulator for the concrete types, and
 without aggregate filters, ordering, `DISTINCT`, grouping sets, or aggregate TopK. Other
 shapes retain the coordinator-only plan. The wire field is optional; when an older worker
 does not accept the fragment, the client applies the same partial aggregate to its raw
