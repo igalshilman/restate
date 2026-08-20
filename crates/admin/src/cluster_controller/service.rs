@@ -36,9 +36,7 @@ use restate_metadata_store::ReadModifyWriteError;
 use restate_storage_query_datafusion::BuildError;
 use restate_storage_query_datafusion::context::{ClusterTables, QueryContext};
 use restate_storage_query_datafusion::remote_query_scanner_client::create_remote_scanner_service;
-use restate_storage_query_datafusion::remote_query_scanner_manager::{
-    RemoteScannerManager, create_partition_locator,
-};
+use restate_storage_query_datafusion::remote_query_scanner_manager::RemoteScannerManager;
 use restate_types::cluster::cluster_state::LegacyClusterState;
 use restate_types::config::{AdminOptions, Configuration};
 use restate_types::health::HealthStatus;
@@ -113,12 +111,9 @@ where
 
         let remote_scanner_manager = RemoteScannerManager::new(
             create_remote_scanner_service(networking.clone()),
-            create_partition_locator(
-                restate_core::partitions::PartitionRouting::new(
-                    replica_set_states.clone(),
-                    TaskCenter::current(),
-                ),
-                Metadata::current(),
+            restate_core::partitions::PartitionRouting::new(
+                replica_set_states.clone(),
+                TaskCenter::current(),
             ),
             Metadata::current(),
         );

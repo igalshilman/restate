@@ -28,9 +28,10 @@ use restate_worker_api::UserLimitCounterEntry;
 
 use crate::context::{PartitionLeaderStatusHandle, QueryContext, SelectPartitions};
 use crate::filter::FirstMatchingPartitionKeyExtractor;
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::statistics::{RowEstimate, TableStatisticsBuilder};
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 use crate::table_util::Builder;
 use crate::user_limits::row::append_user_limit_row;
 use crate::user_limits::schema::{SysUserLimitsBuilder, sys_user_limits_sort_order};

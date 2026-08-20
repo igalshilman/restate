@@ -27,8 +27,9 @@ use crate::keyed_service_status::schema::{
     SysKeyedServiceStatusBuilder, sys_keyed_service_status_sort_order,
 };
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 const NAME: &str = "sys_keyed_service_status";
 
 pub(crate) fn register_self(

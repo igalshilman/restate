@@ -24,8 +24,9 @@ use crate::filter::FirstMatchingPartitionKeyExtractor;
 use crate::locks::row::append_lock_row;
 use crate::locks::schema::{SysLocksBuilder, sys_locks_sort_order};
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 const NAME: &str = "sys_locks";
 
 pub(crate) fn register_self(

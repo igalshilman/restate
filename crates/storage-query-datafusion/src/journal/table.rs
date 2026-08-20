@@ -28,8 +28,9 @@ use crate::filter::InvocationIdFilter;
 use crate::journal::row::{append_journal_row, append_journal_row_v2};
 use crate::journal::schema::{SysJournalBuilder, sys_journal_sort_order};
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 
 const NAME: &str = "sys_journal";
 

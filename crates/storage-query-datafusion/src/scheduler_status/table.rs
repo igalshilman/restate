@@ -30,10 +30,11 @@ use restate_worker_api::{SchedulerStatusEntry, SchedulingStatus};
 
 use crate::context::{PartitionLeaderStatusHandle, QueryContext, SelectPartitions};
 use crate::filter::FirstMatchingPartitionKeyExtractor;
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::scheduler_status::schema::{SysSchedulerBuilder, sys_scheduler_sort_order};
 use crate::statistics::{RowEstimate, TableStatisticsBuilder};
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 use crate::table_util::Builder;
 
 const NAME: &str = "sys_scheduler";

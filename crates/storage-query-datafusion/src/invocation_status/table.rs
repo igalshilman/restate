@@ -28,11 +28,12 @@ use crate::invocation_status::schema::{
     SysInvocationStatusBuilder, sys_invocation_status_sort_order,
 };
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::statistics::{
     DEPLOYMENT_ROW_ESTIMATE, RowEstimate, SERVICE_ROW_ESTIMATE, TableStatisticsBuilder,
 };
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 
 const NAME: &str = "sys_invocation_status";
 

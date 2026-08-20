@@ -21,8 +21,9 @@ use crate::filter::FirstMatchingPartitionKeyExtractor;
 use crate::inbox::row::append_inbox_row;
 use crate::inbox::schema::{SysInboxBuilder, sys_inbox_sort_order};
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 
 const NAME: &str = "sys_inbox";
 

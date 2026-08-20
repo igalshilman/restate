@@ -32,9 +32,7 @@ use restate_service_protocol_v4::serdes::SerdesClient;
 use restate_storage_query_datafusion::context::{QueryContext, SelectPartitionsFromMetadata};
 use restate_storage_query_datafusion::empty_invoker_status_handle::EmptyInvokerStatusHandle;
 use restate_storage_query_datafusion::remote_query_scanner_client::create_remote_scanner_service;
-use restate_storage_query_datafusion::remote_query_scanner_manager::{
-    RemoteScannerManager, create_partition_locator,
-};
+use restate_storage_query_datafusion::remote_query_scanner_manager::RemoteScannerManager;
 use restate_types::config::Configuration;
 use restate_types::health::HealthStatus;
 use restate_types::live::Live;
@@ -121,7 +119,7 @@ impl<T: TransportConnect> AdminRole<T> {
         } else {
             let remote_scanner_manager = RemoteScannerManager::new(
                 create_remote_scanner_service(networking.clone()),
-                create_partition_locator(partition_routing.clone(), metadata.clone()),
+                partition_routing.clone(),
                 metadata.clone(),
             );
 

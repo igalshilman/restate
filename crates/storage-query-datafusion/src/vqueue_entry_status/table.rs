@@ -22,9 +22,10 @@ use restate_types::vqueues::{EntryId, VQueueId};
 use crate::context::{QueryContext, SelectPartitions};
 use crate::filter::{FirstMatchingPartitionKeyExtractor, VQueueEntryIdFilter};
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partitioned_table_provider::PartitionedTableProvider;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::statistics::{DEPLOYMENT_ROW_ESTIMATE, RowEstimate, TableStatisticsBuilder};
-use crate::table_providers::{PartitionedTableProvider, ScanPartition};
+use crate::table_providers::ScanPartition;
 use crate::vqueue_entry_status::row::append_vqueue_entry_status_row;
 use crate::vqueue_entry_status::schema::{
     SysVqueueEntryStatusBuilder, sys_vqueue_entry_status_sort_order,

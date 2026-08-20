@@ -37,9 +37,7 @@ use restate_limiter::rule_book::RuleBookObserver;
 use restate_log_server::LogServerService;
 use restate_storage_query_datafusion::context::{NoTables, QueryContext};
 use restate_storage_query_datafusion::remote_query_scanner_client::create_remote_scanner_service;
-use restate_storage_query_datafusion::remote_query_scanner_manager::{
-    RemoteScannerManager, create_partition_locator,
-};
+use restate_storage_query_datafusion::remote_query_scanner_manager::RemoteScannerManager;
 use restate_storage_query_datafusion::remote_query_scanner_server::RemoteQueryScannerServer;
 
 use restate_metadata_server::{
@@ -339,15 +337,12 @@ impl Node {
         );
 
         // Create a node-level RemoteScannerManager shared across all roles.
-        // The partition locator routes partition-scoped scan RPCs to the right
-        // node, and the RemoteQueryScannerServer below serves scan RPCs for
-        // all registered scanners regardless of role.
+        // Partition routing assigns partition-scoped scan RPCs to the right
+        // node, and the server below serves all registered scanners regardless
+        // of role.
         let remote_scanner_manager = RemoteScannerManager::new(
             create_remote_scanner_service(networking.clone()),
-            create_partition_locator(
-                PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
-                metadata.clone(),
-            ),
+            PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
             metadata.clone(),
         );
 
